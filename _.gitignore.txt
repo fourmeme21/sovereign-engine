@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Ortam değişkenleri — JWT_SECRET ve diğer gizli bilgiler
+.env
+.env.local
+.env.production
+JWT_SECRET
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
