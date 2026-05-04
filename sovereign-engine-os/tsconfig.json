@@ -1,0 +1,40 @@
+{
+  "compilerOptions": {
+    /* Dil ve Hedef */
+    "target": "ES2022",
+    "lib": ["ES2022"],
+
+    /* Modül Sistemi */
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    /* Çıktı */
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+
+    /* Strict — güvenlik çekirdeği için zorunlu */
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "exactOptionalPropertyTypes": true,
+
+    /* Ek Güvenlik */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+
+    /* Birlikte Çalışabilirlik */
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+
+    /* Rust tip eşleştirme — ts-rs çıktısı için */
+    "resolveJsonModule": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+}
