@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "sovereign-types",
+    "sovereign-core",
+]
+
+# ─── WORKSPACE-WIDE BAĞIMLILIKLAR ────────────────────────────────────────────
+# Versiyon tek noktadan yönetilir — crate Cargo.toml'larında tekrarlanmaz.
+
+[workspace.dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ─── RELEASE PROFİLİ ─────────────────────────────────────────────────────────
+# Karar: panic = "abort" (Rapor 2 — güvenlik çekirdeği için zorunlu)
+#
+# GEREKÇE:
+#   - Güvenlik çekirdeğinde stack unwinding tehlikeli: bir saldırgan paniğe
+#     neden olan girdi üretirse Rust'ın destructors zinciri manipüle edilebilir.
+#   - panic = "abort" → panik anında proses anında sonlanır, unwinding olmaz.
+#   - catch_unwind (Rapor 1'in önerisi) sadece FFI sınırlarında kullanılabilir;
+#     tüm kod için değil.
+#   - TypeScript tarafı non-zero exit'i BINARY_CRASH olarak yakalar → fail-closed.
+#
+# NOT: Bu ayar catch_unwind'ı devre dışı bırakır. Eğer dış C kütüphanesi
+# entegrasyonu gerekirse (Faz 5+) bu satırı değerlendirin.
+[profile.release]
+panic = "abort"
+
+# Dev profilde unwinding açık kalır — testlerde catch_unwind gerekebilir.
+[profile.dev]
+panic = "unwind"
