@@ -1,0 +1,16 @@
+[package]
+name    = "sovereign-types"
+version = "0.1.0"
+edition = "2021"
+
+# ─── FEATURE FLAGS ───────────────────────────────────────────────────────────
+# serde feature isteğe bağlı — sadece JSON (de)serialize gereken katmanlar açar.
+# Rapor 2 §8: "sadece veri yapılarına ihtiyaç duyan katmanlar ağır
+# bağımlılıkları yüklemek zorunda kalmamalıdır."
+[features]
+default = ["serde"]
+serde   = ["dep:serde", "dep:serde_json"]
+
+[dependencies]
+serde      = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
