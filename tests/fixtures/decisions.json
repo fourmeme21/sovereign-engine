@@ -1,0 +1,556 @@
+[
+  {
+    "_fixture_id": 1,
+    "_valid": true,
+    "_note": "Geçerli — READ_DATA, LOW risk",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000001",
+    "created_at": "2026-05-04T08:00:00.000Z",
+    "intent": "READ_DATA",
+    "category": "USER_MANAGEMENT",
+    "payload": {
+      "action_name": "get_user",
+      "params": { "user_id": "user-42" }
+    },
+    "context": {
+      "actor_id": "operator-1",
+      "actor_role": "operator",
+      "session_id": "session-5",
+      "risk_level": "LOW"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 5,
+      "confidence": "HIGH",
+      "self_check_passed": true
+    },
+    "status": "PENDING"
+  },
+  {
+    "_fixture_id": 2,
+    "_valid": true,
+    "_note": "Geçerli — WRITE_DATA, MEDIUM risk",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000002",
+    "created_at": "2026-05-04T08:01:00.000Z",
+    "intent": "WRITE_DATA",
+    "category": "USER_MANAGEMENT",
+    "payload": {
+      "action_name": "create_user",
+      "params": { "username": "alice", "role": "viewer" }
+    },
+    "context": {
+      "actor_id": "operator-1",
+      "actor_role": "operator",
+      "session_id": "session-5",
+      "risk_level": "MEDIUM"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 5,
+      "confidence": "HIGH",
+      "self_check_passed": true
+    },
+    "status": "PENDING"
+  },
+  {
+    "_fixture_id": 3,
+    "_valid": true,
+    "_note": "Geçerli — EXECUTE_ACTION + assumed_state, HIGH risk",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000003",
+    "created_at": "2026-05-04T08:02:00.000Z",
+    "intent": "EXECUTE_ACTION",
+    "category": "PAYMENT_PROCESSING",
+    "payload": {
+      "action_name": "process_payment",
+      "params": { "amount": 150.00, "currency": "USD", "recipient_id": "user-99" },
+      "assumed_state": { "balance": 500.00, "account_status": "ACTIVE" }
+    },
+    "context": {
+      "actor_id": "operator-1",
+      "actor_role": "operator",
+      "session_id": "session-5",
+      "risk_level": "HIGH"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 5,
+      "confidence": "MEDIUM",
+      "self_check_passed": true
+    },
+    "status": "PENDING"
+  },
+  {
+    "_fixture_id": 4,
+    "_valid": true,
+    "_note": "Geçerli — TRIGGER_EVENT, MEDIUM risk",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000004",
+    "created_at": "2026-05-04T08:03:00.000Z",
+    "intent": "TRIGGER_EVENT",
+    "category": "NOTIFICATION_SERVICE",
+    "payload": {
+      "action_name": "send_email",
+      "params": { "recipient": "alice@example.com", "template": "welcome" }
+    },
+    "context": {
+      "actor_id": "system-bot",
+      "actor_role": "system",
+      "session_id": "session-5",
+      "risk_level": "MEDIUM"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 5,
+      "confidence": "HIGH",
+      "self_check_passed": true
+    },
+    "status": "PENDING"
+  },
+  {
+    "_fixture_id": 5,
+    "_valid": true,
+    "_note": "Geçerli — MODIFY_STATE + CRITICAL risk (zorunlu)",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000005",
+    "created_at": "2026-05-04T08:04:00.000Z",
+    "intent": "MODIFY_STATE",
+    "category": "SYSTEM_CONFIG",
+    "payload": {
+      "action_name": "toggle_feature_flag",
+      "params": { "flag": "new_checkout_flow", "enabled": true },
+      "assumed_state": { "flag": "new_checkout_flow", "enabled": false }
+    },
+    "context": {
+      "actor_id": "operator-1",
+      "actor_role": "operator",
+      "session_id": "session-5",
+      "risk_level": "CRITICAL"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 5,
+      "confidence": "MEDIUM",
+      "self_check_passed": true
+    },
+    "status": "PENDING"
+  },
+  {
+    "_fixture_id": 6,
+    "_valid": true,
+    "_note": "Geçerli — VALIDATED durumunda, hierarchy_path dahil",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000006",
+    "created_at": "2026-05-04T08:05:00.000Z",
+    "intent": "WRITE_DATA",
+    "category": "INVENTORY",
+    "payload": {
+      "action_name": "update_stock",
+      "params": { "product_id": "prod-7", "quantity": 50 }
+    },
+    "context": {
+      "actor_id": "manager-3",
+      "actor_role": "manager",
+      "session_id": "session-5",
+      "risk_level": "MEDIUM",
+      "hierarchy_path": ["org", "warehouse", "zone-a"]
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 5,
+      "confidence": "HIGH",
+      "self_check_passed": true,
+      "token_budget_spent": 420
+    },
+    "status": "VALIDATED"
+  },
+  {
+    "_fixture_id": 7,
+    "_valid": true,
+    "_note": "Geçerli — POLICY_APPROVED durumu, audit_hash var",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000007",
+    "created_at": "2026-05-04T08:06:00.000Z",
+    "intent": "READ_DATA",
+    "category": "AUDIT_LOG",
+    "payload": {
+      "action_name": "get_audit_entries",
+      "params": { "limit": 100, "since": "2026-05-01T00:00:00.000Z" }
+    },
+    "context": {
+      "actor_id": "auditor-1",
+      "actor_role": "auditor",
+      "session_id": "session-5",
+      "risk_level": "LOW"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 5,
+      "confidence": "HIGH",
+      "self_check_passed": true
+    },
+    "status": "POLICY_APPROVED",
+    "audit_hash": "sha256:7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069"
+  },
+  {
+    "_fixture_id": 8,
+    "_valid": true,
+    "_note": "Geçerli — COMPLETED durumu, audit_hash zorunlu",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000008",
+    "created_at": "2026-05-04T08:07:00.000Z",
+    "intent": "WRITE_DATA",
+    "category": "ORDER_MANAGEMENT",
+    "payload": {
+      "action_name": "create_order",
+      "params": { "customer_id": "cust-12", "items": [{ "sku": "SKU-001", "qty": 2 }] }
+    },
+    "context": {
+      "actor_id": "operator-2",
+      "actor_role": "operator",
+      "session_id": "session-5",
+      "risk_level": "MEDIUM"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 3,
+      "confidence": "HIGH",
+      "self_check_passed": true,
+      "token_budget_spent": 310
+    },
+    "status": "COMPLETED",
+    "audit_hash": "sha256:2c624232cdd221771294dfbb310acbc8ba7015fc8b2f4e4207a3571e5f06f7b"
+  },
+  {
+    "_fixture_id": 9,
+    "_valid": false,
+    "_reject_reason": "schema_version eksik → REJECT",
+    "id": "01952f3e-7b2a-7000-8000-000000000009",
+    "created_at": "2026-05-04T08:08:00.000Z",
+    "intent": "READ_DATA",
+    "category": "USER_MANAGEMENT",
+    "payload": {
+      "action_name": "get_user",
+      "params": { "user_id": "user-1" }
+    },
+    "context": {
+      "actor_id": "operator-1",
+      "actor_role": "operator",
+      "session_id": "session-5",
+      "risk_level": "LOW"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 5,
+      "confidence": "HIGH",
+      "self_check_passed": true
+    },
+    "status": "PENDING"
+  },
+  {
+    "_fixture_id": 10,
+    "_valid": false,
+    "_reject_reason": "category regex /^[A-Z_]+$/ uyumsuz → REJECT",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000010",
+    "created_at": "2026-05-04T08:09:00.000Z",
+    "intent": "WRITE_DATA",
+    "category": "user-management",
+    "payload": {
+      "action_name": "create_user",
+      "params": { "username": "bob" }
+    },
+    "context": {
+      "actor_id": "operator-1",
+      "actor_role": "operator",
+      "session_id": "session-5",
+      "risk_level": "MEDIUM"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 5,
+      "confidence": "HIGH",
+      "self_check_passed": true
+    },
+    "status": "PENDING"
+  },
+  {
+    "_fixture_id": 11,
+    "_valid": false,
+    "_reject_reason": "action_name regex /^[a-z_]+$/ uyumsuz → REJECT",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000011",
+    "created_at": "2026-05-04T08:10:00.000Z",
+    "intent": "WRITE_DATA",
+    "category": "USER_MANAGEMENT",
+    "payload": {
+      "action_name": "CreateUser",
+      "params": { "username": "charlie" }
+    },
+    "context": {
+      "actor_id": "operator-1",
+      "actor_role": "operator",
+      "session_id": "session-5",
+      "risk_level": "MEDIUM"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 5,
+      "confidence": "HIGH",
+      "self_check_passed": true
+    },
+    "status": "PENDING"
+  },
+  {
+    "_fixture_id": 12,
+    "_valid": false,
+    "_reject_reason": "session_number = 0 → REJECT (≤ 0 yasak)",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000012",
+    "created_at": "2026-05-04T08:11:00.000Z",
+    "intent": "READ_DATA",
+    "category": "USER_MANAGEMENT",
+    "payload": {
+      "action_name": "get_user",
+      "params": { "user_id": "user-1" }
+    },
+    "context": {
+      "actor_id": "operator-1",
+      "actor_role": "operator",
+      "session_id": "session-5",
+      "risk_level": "LOW"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 0,
+      "confidence": "HIGH",
+      "self_check_passed": true
+    },
+    "status": "PENDING"
+  },
+  {
+    "_fixture_id": 13,
+    "_valid": false,
+    "_reject_reason": "confidence=HIGH + self_check_passed=false → REJECT (çelişki)",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000013",
+    "created_at": "2026-05-04T08:12:00.000Z",
+    "intent": "WRITE_DATA",
+    "category": "USER_MANAGEMENT",
+    "payload": {
+      "action_name": "create_user",
+      "params": { "username": "dave" }
+    },
+    "context": {
+      "actor_id": "operator-1",
+      "actor_role": "operator",
+      "session_id": "session-5",
+      "risk_level": "MEDIUM"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 5,
+      "confidence": "HIGH",
+      "self_check_passed": false
+    },
+    "status": "PENDING"
+  },
+  {
+    "_fixture_id": 14,
+    "_valid": false,
+    "_reject_reason": "risk_level=CRITICAL + confidence=HIGH → REJECT",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000014",
+    "created_at": "2026-05-04T08:13:00.000Z",
+    "intent": "MODIFY_STATE",
+    "category": "SYSTEM_CONFIG",
+    "payload": {
+      "action_name": "disable_auth",
+      "params": { "service": "api-gateway" },
+      "assumed_state": { "auth_enabled": true }
+    },
+    "context": {
+      "actor_id": "operator-1",
+      "actor_role": "operator",
+      "session_id": "session-5",
+      "risk_level": "CRITICAL"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 5,
+      "confidence": "HIGH",
+      "self_check_passed": true
+    },
+    "status": "PENDING"
+  },
+  {
+    "_fixture_id": 15,
+    "_valid": false,
+    "_reject_reason": "intent=MODIFY_STATE + risk_level=HIGH → REJECT (CRITICAL zorunlu)",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000015",
+    "created_at": "2026-05-04T08:14:00.000Z",
+    "intent": "MODIFY_STATE",
+    "category": "SYSTEM_CONFIG",
+    "payload": {
+      "action_name": "update_rate_limit",
+      "params": { "limit": 1000 }
+    },
+    "context": {
+      "actor_id": "operator-1",
+      "actor_role": "operator",
+      "session_id": "session-5",
+      "risk_level": "HIGH"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 5,
+      "confidence": "MEDIUM",
+      "self_check_passed": true
+    },
+    "status": "PENDING"
+  },
+  {
+    "_fixture_id": 16,
+    "_valid": false,
+    "_reject_reason": "assumed_state + intent=WRITE_DATA → REJECT",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000016",
+    "created_at": "2026-05-04T08:15:00.000Z",
+    "intent": "WRITE_DATA",
+    "category": "USER_MANAGEMENT",
+    "payload": {
+      "action_name": "create_user",
+      "params": { "username": "eve" },
+      "assumed_state": { "user_count": 99 }
+    },
+    "context": {
+      "actor_id": "operator-1",
+      "actor_role": "operator",
+      "session_id": "session-5",
+      "risk_level": "MEDIUM"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 5,
+      "confidence": "HIGH",
+      "self_check_passed": true
+    },
+    "status": "PENDING"
+  },
+  {
+    "_fixture_id": 17,
+    "_valid": false,
+    "_reject_reason": "assumed_state + intent=READ_DATA → REJECT",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000017",
+    "created_at": "2026-05-04T08:16:00.000Z",
+    "intent": "READ_DATA",
+    "category": "REPORT_SERVICE",
+    "payload": {
+      "action_name": "get_report",
+      "params": { "report_id": "rpt-1" },
+      "assumed_state": { "ready": true }
+    },
+    "context": {
+      "actor_id": "operator-1",
+      "actor_role": "operator",
+      "session_id": "session-5",
+      "risk_level": "LOW"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 5,
+      "confidence": "HIGH",
+      "self_check_passed": true
+    },
+    "status": "PENDING"
+  },
+  {
+    "_fixture_id": 18,
+    "_valid": false,
+    "_reject_reason": "schema_version='2.0' → REJECT (Rust binary uyumsuzluğu)",
+    "schema_version": "2.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000018",
+    "created_at": "2026-05-04T08:17:00.000Z",
+    "intent": "READ_DATA",
+    "category": "USER_MANAGEMENT",
+    "payload": {
+      "action_name": "get_user",
+      "params": { "user_id": "user-1" }
+    },
+    "context": {
+      "actor_id": "operator-1",
+      "actor_role": "operator",
+      "session_id": "session-5",
+      "risk_level": "LOW"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 5,
+      "confidence": "HIGH",
+      "self_check_passed": true
+    },
+    "status": "PENDING"
+  },
+  {
+    "_fixture_id": 19,
+    "_valid": true,
+    "_note": "Geçerli — BLOCKED durumu (immutable)",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000019",
+    "created_at": "2026-05-04T08:18:00.000Z",
+    "intent": "WRITE_DATA",
+    "category": "FINANCIAL_TRANSACTION",
+    "payload": {
+      "action_name": "transfer_funds",
+      "params": { "from": "acc-1", "to": "acc-2", "amount": 9999 }
+    },
+    "context": {
+      "actor_id": "user-77",
+      "actor_role": "user",
+      "session_id": "session-5",
+      "risk_level": "MEDIUM"
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 5,
+      "confidence": "LOW",
+      "self_check_passed": true
+    },
+    "status": "BLOCKED",
+    "audit_hash": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+  },
+  {
+    "_fixture_id": 20,
+    "_valid": true,
+    "_note": "Geçerli — REJECTED durumu, session_number=1 (ilk session)",
+    "schema_version": "1.0",
+    "id": "01952f3e-7b2a-7000-8000-000000000020",
+    "created_at": "2026-05-04T08:19:00.000Z",
+    "intent": "EXECUTE_ACTION",
+    "category": "DEPLOYMENT_SERVICE",
+    "payload": {
+      "action_name": "deploy_service",
+      "params": { "service": "api-v2", "env": "production" },
+      "assumed_state": { "current_version": "1.9.0", "health": "GREEN" }
+    },
+    "context": {
+      "actor_id": "devops-1",
+      "actor_role": "operator",
+      "session_id": "session-1",
+      "risk_level": "HIGH",
+      "hierarchy_path": ["org", "platform", "production"]
+    },
+    "metadata": {
+      "model": "claude-sonnet-4-6",
+      "session_number": 1,
+      "confidence": "MEDIUM",
+      "self_check_passed": true,
+      "token_budget_spent": 850
+    },
+    "status": "REJECTED",
+    "audit_hash": "sha256:ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+  }
+]
