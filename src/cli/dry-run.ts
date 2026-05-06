@@ -1,0 +1,252 @@
+/**
+ * Sovereign Engine OS — CLI dry-run komutu
+ * @module src/cli/dry-run
+ *
+ * `sovereign dry-run <patch.json>`
+ *
+ * Akış (ARCHITECTURE.md §4 — Adım 1-5):
+ *   1-3. validate ile aynı (Patch + Decision + ValidationEngine)
+ *   4.   Policy Kernel — Faz 3'e kadar simüle edilir (stub)
+ *   5.   Diff üret — dosyaya DOKUNMA
+ *
+ * ⚠️ dry-run hiçbir dosyayı değiştirmez — sadece gösterir.
+ *
+ * Exit kodları:
+ *   0 = PASS + diff gösterildi
+ *   1 = REJECTED
+ *   2 = ASK_HUMAN
+ *   3 = Dosya okuma hatası
+ *   4 = Hedef dosya bulunamadı (diff için)
+ */
+
+import { readFile }                     from "fs/promises";
+import { createValidationEngine }       from "../validation/engine.js";
+import { isPatch, isConfidenceValid,
+         isOperationsValid }            from "../types/patch.js";
+import type { Patch, PatchOperation }   from "../types/patch.js";
+import { formatError }                  from "../validation/errors.js";
+import { patchToDecision, getCliActor } from "./patch-to-decision.js";
+
+// ---------------------------------------------------------------------------
+// ANSI renk sabitleri
+// ---------------------------------------------------------------------------
+const GREEN  = "\x1b[32m";
+const RED    = "\x1b[31m";
+const YELLOW = "\x1b[33m";
+const CYAN   = "\x1b[36m";
+const GRAY   = "\x1b[90m";
+const RESET  = "\x1b[0m";
+const BOLD   = "\x1b[1m";
+
+// ---------------------------------------------------------------------------
+// Diff Üretimi
+// ---------------------------------------------------------------------------
+
+export interface DiffResult {
+  file:         string;
+  found:        boolean;
+  operations:   OperationDiff[];
+  total_ops:    number;
+  applied_ops:  number;
+}
+
+export interface OperationDiff {
+  index:    number;
+  search:   string;
+  replace:  string;
+  found:    boolean;
+  preview?: string;   // Değişiklik sonrası ilgili satır
+}
+
+/**
+ * Hedef dosyayı okuyup patch operasyonlarının uygulanabilirliğini kontrol eder.
+ * Dosyayı değiştirmez — sadece diff üretir.
+ */
+async function generateDiff(patch: Patch): Promise<DiffResult> {
+  let content: string;
+  let found = true;
+
+  try {
+    content = await readFile(patch.patch.file, "utf-8");
+  } catch {
+    return {
+      file:        patch.patch.file,
+      found:       false,
+      operations:  [],
+      total_ops:   patch.patch.operations.length,
+      applied_ops: 0,
+    };
+  }
+
+  const operations: OperationDiff[] = patch.patch.operations.map((op: PatchOperation, i: number) => {
+    const searchFound = content.includes(op.search);
+    let preview: string | undefined;
+
+    if (searchFound) {
+      // Değişiklik sonrası görünümü simüle et (ilk 80 karakter)
+      const simulated = content.replace(op.search, op.replace);
+      const idx       = simulated.indexOf(op.replace);
+      const start     = Math.max(0, idx - 20);
+      preview         = "..." + simulated.slice(start, start + 80) + "...";
+    }
+
+    return {
+      index:   i + 1,
+      search:  op.search,
+      replace: op.replace,
+      found:   searchFound,
+      preview,
+    };
+  });
+
+  return {
+    file:        patch.patch.file,
+    found,
+    operations,
+    total_ops:   operations.length,
+    applied_ops: operations.filter(o => o.found).length,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Diff Yazdırma
+// ---------------------------------------------------------------------------
+
+function printDiff(diff: DiffResult): void {
+  process.stdout.write(`\n${BOLD}📄 Hedef Dosya:${RESET} ${CYAN}${diff.file}${RESET}\n`);
+
+  if (!diff.found) {
+    process.stdout.write(`${RED}  ✗ Dosya bulunamadı${RESET}\n`);
+    return;
+  }
+
+  process.stdout.write(`  Operasyon: ${diff.applied_ops}/${diff.total_ops} uygulanabilir\n\n`);
+
+  diff.operations.forEach(op => {
+    if (op.found) {
+      process.stdout.write(
+        `  ${GREEN}✓${RESET} Operasyon #${op.index}\n` +
+        `    ${RED}- ${truncate(op.search, 60)}${RESET}\n` +
+        `    ${GREEN}+ ${truncate(op.replace, 60)}${RESET}\n` +
+        (op.preview ? `    ${GRAY}  ↳ ${op.preview}${RESET}\n` : "") +
+        "\n"
+      );
+    } else {
+      process.stdout.write(
+        `  ${RED}✗${RESET} Operasyon #${op.index} — ${YELLOW}search metni bulunamadı${RESET}\n` +
+        `    ${GRAY}Aranan: "${truncate(op.search, 60)}"${RESET}\n\n`
+      );
+    }
+  });
+}
+
+function truncate(str: string, max: number): string {
+  return str.length > max ? str.slice(0, max) + "…" : str;
+}
+
+// ---------------------------------------------------------------------------
+// Dry-Run Komutu
+// ---------------------------------------------------------------------------
+
+export interface DryRunOptions {
+  json?: boolean;
+}
+
+export async function runDryRun(filePath: string, opts: DryRunOptions = {}): Promise<number> {
+  // ── Adım 1: Dosya Yükleme ──────────────────────────────────────────────
+  let raw: unknown;
+  try {
+    const content = await readFile(filePath, "utf-8");
+    raw = JSON.parse(content);
+  } catch (e) {
+    const msg = `Dosya okunamadı: ${filePath}\n${e instanceof Error ? e.message : String(e)}`;
+    if (opts.json) {
+      process.stdout.write(JSON.stringify({ status: "ERROR", reason: msg }) + "\n");
+    } else {
+      process.stderr.write(`${RED}✗ ${msg}${RESET}\n`);
+    }
+    return 3;
+  }
+
+  // ── Adım 1b: Patch Şema Kontrolü ──────────────────────────────────────
+  if (!isPatch(raw) || !isConfidenceValid(raw.confidence) || !isOperationsValid(raw)) {
+    const msg = "Geçersiz patch.json — önce `sovereign validate` çalıştırın.";
+    if (opts.json) {
+      process.stdout.write(JSON.stringify({ status: "REJECTED", reason: msg }) + "\n");
+    } else {
+      process.stderr.write(`${RED}✗ ${msg}${RESET}\n`);
+    }
+    return 1;
+  }
+
+  // ── Adım 2: Decision Object ────────────────────────────────────────────
+  const actor    = getCliActor();
+  const decision = patchToDecision(raw, actor);
+
+  // ── Adım 3: Validation Engine ─────────────────────────────────────────
+  const engine = createValidationEngine();
+  const result = await engine.validate(decision);
+
+  if (result.status !== "PASS") {
+    if (opts.json) {
+      process.stdout.write(JSON.stringify({
+        status: result.status,
+        error:  result.error ?? null,
+      }) + "\n");
+    } else {
+      const prefix = result.status === "ASK_HUMAN"
+        ? `${YELLOW}${BOLD}⚠ ASK_HUMAN${RESET}`
+        : `${RED}${BOLD}✗ REJECTED${RESET}`;
+      process.stderr.write(
+        `${prefix} — ${CYAN}${filePath}${RESET}\n\n` +
+        (result.error ? formatError(result.error) : "") + "\n"
+      );
+    }
+    return result.status === "ASK_HUMAN" ? 2 : 1;
+  }
+
+  // ── Adım 4: Policy Kernel Stub (Faz 3'e kadar) ─────────────────────────
+  // Gerçek Policy Kernel Faz 3'te eklenir.
+  // Şimdilik: Validation geçti = simüle edilmiş PERMIT
+  const policyNote = `${YELLOW}⚠ Policy Kernel Faz 3'te eklenecek — şu an simüle ediliyor${RESET}`;
+
+  // ── Adım 5: Diff Üret ─────────────────────────────────────────────────
+  const diff = await generateDiff(raw);
+
+  if (opts.json) {
+    process.stdout.write(JSON.stringify({
+      status:      "PASS",
+      decision_id: result.data?.id,
+      diff,
+    }) + "\n");
+    return diff.found && diff.applied_ops === diff.total_ops ? 0 : 1;
+  }
+
+  // ── İnsan Okunabilir Çıktı ─────────────────────────────────────────────
+  process.stdout.write(
+    `\n${GREEN}${BOLD}✓ PASS${RESET} — ${CYAN}${filePath}${RESET}\n` +
+    `  Decision ID : ${result.data?.id}\n` +
+    `  Intent      : ${raw.intent}\n` +
+    `  Risk        : ${result.data?.context.risk_level}\n` +
+    `  Confidence  : ${raw.confidence}\n\n` +
+    `${policyNote}\n`
+  );
+
+  printDiff(diff);
+
+  const allApplied = diff.found && diff.applied_ops === diff.total_ops;
+  if (allApplied) {
+    process.stdout.write(
+      `\n${GREEN}${BOLD}✓ Dry-run tamamlandı${RESET} — tüm operasyonlar uygulanabilir.\n` +
+      `  Uygulamak için: ${CYAN}sovereign apply ${filePath}${RESET}` +
+      ` ${YELLOW}(Faz 4'te aktif olacak)${RESET}\n\n`
+    );
+  } else {
+    process.stdout.write(
+      `\n${RED}${BOLD}✗ Dry-run başarısız${RESET} — ${diff.total_ops - diff.applied_ops} operasyon uygulanamaz.\n` +
+      `  Patch dosyasını güncelleyin ve tekrar deneyin.\n\n`
+    );
+  }
+
+  return allApplied ? 0 : 1;
+}
