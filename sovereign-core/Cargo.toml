@@ -1,85 +1,33 @@
 [package]
-name    = "sovereign-core"
+name = "sovereign-policy-kernel"
 version = "0.1.0"
 edition = "2021"
+description = "Sovereign Engine OS — Policy Kernel (Güvenlik Çekirdeği)"
 
-[[bin]]
-name = "sovereign-core"
-path = "src/main.rs"
-
-# ─── BAĞIMLILIKLAR ────────────────────────────────────────────────────────────
 [dependencies]
-# Paylaşılan tipler — JSON desteği açık
-sovereign-types = { path = "../sovereign-types", features = ["serde"] }
+# JSON serileştirme — deny_unknown_fields için zorunlu
+serde       = { version = "1.0.203", features = ["derive"] }
+serde_json  = { version = "1.0.117", features = ["preserve_order"] }
 
-# Serde ekosistemi (workspace'den)
-serde      = { workspace = true }
-serde_json = { workspace = true }
+# RFC 8785 Canonical JSON — deterministik hash için
+serde_json_canonicalizer = "0.3.2"
 
-# Kanonik JSON — policy_hash tutarlılığı için zorunlu (RFC 8785 / JCS)
-#
-# KARAR: serde_jcs (Rapor 2, §4 — "Kanonik JSON Kullanımı")
-#
-# GEREKÇE:
-#   policy_hash = SHA-256(canonical(decision) + policy_result)
-#   Farklı diller / kütüphaneler JSON anahtarlarını farklı sıralarda üretebilir.
-#   serde_jcs deterministik byte-level temsil garantisi verir (JCS: JSON
-#   Canonicalization Scheme). Olmadan Rust ≠ TypeScript hash → HASH_MISMATCH.
-serde_jcs = "0.2"
+# Kriptografi
+sha2         = "0.11.0"
+hex          = "0.4.3"
+jsonwebtoken = "9.3.0"
 
-# JWT — execution_token üretimi ve doğrulaması (ARCHITECTURE.md §2.2)
-#
-# KARAR: jwt-simple → jsonwebtoken'a tercih edildi (Rapor 2, §4)
-#
-# GEREKÇE:
-#   jwt-simple "none" algoritma saldırısını API düzeyinde engeller —
-#   jsonwebtoken geliştirici konfigürasyonuna güvenir. Güvenlik çekirdeğinde
-#   yanlış konfigürasyon riski kabul edilemez.
-#   Faz 3'te implementation başlar; bağımlılık şimdi eklenir.
-jwt-simple = "0.12"
+# Hata yönetimi
+thiserror = "1.0.61"
 
-# SHA-256 — audit log hash chain + policy_hash (ARCHITECTURE.md §6)
-sha2 = "0.10"
+# Zaman yönetimi
+chrono = { version = "0.4.38", features = ["serde"] }
 
-# Idempotency store — TTL destekli bellek içi cache (ARCHITECTURE.md §5)
-#
-# KARAR: moka (her iki rapor hemfikir)
-#
-# GEREKÇE:
-#   - Otomatik TTL eviction → OOM riski yok
-#   - Arka plan thread temizleme → execution path'te latency yok
-#   - DashMap ve Mutex<HashMap> alternatifleri TTL'i manuel yönetmek zorunda
-#   Solo operator ölçeğinde moka yeterlidir; dağıtık sistemde Redis gerekir
-#   (ARCHITECTURE.md §8 teknik borç notu).
-moka = { version = "0.12", features = ["sync"] }
-
-# Sistem çağrıları — monotonik saat + prctl (Linux)
-#
-# KARAR: nix (her iki rapor hemfikir, Rapor 2 daha ayrıntılı)
-#
-# GEREKÇE:
-#   - CLOCK_BOOTTIME: NTP veya kullanıcı müdahalesinden etkilenmeyen monotonik
-#     saat — JWT exp kontrolü için zorunlu (TOCTOU koruması, FP-U7)
-#   - prctl(PR_SET_PDEATHSIG, SIGTERM): Parent process ölürse Rust binary'si
-#     otomatik temizlenir — zombie/orphan process riski yok
-#
-# KARAR: SIGTERM → SIGKILL'e tercih edildi (Rapor 2)
-#   GEREKÇE: SIGTERM temiz kapanış + rollback fırsatı verir.
-#   SIGKILL anında öldürür; audit log yarım kalabilir.
-nix = { version = "0.27", features = ["time", "process"] }
-
-# JWT secret güvenli depolama
-#
-# GEREKÇE: SecretString, secret'ı bellek dump'larında ve Debug çıktılarında
-# gizler. std::env::var ile alınan raw string log'a sızabilir.
-secrecy = "0.10"
-
-# ─── DEV BAĞIMLILIKLARI ───────────────────────────────────────────────────────
-[dev-dependencies]
-# CLI entegrasyon testleri (Rapor 2, §10)
-#
-# GEREKÇE: assert_cmd, binary'yi TypeScript'in gördüğü gibi test eder —
-# stdin'e JSON ver, exit code + stdout + stderr assert et.
-# Örnek: test_invalid_jwt_returns_deny() → code(1) + stderr("JWT_INVALID")
-assert_cmd = "2.0"
-predicates = "3.0"
+[profile.release]
+# Güvenlik: panik → anında sonlanma (stack unwinding yok)
+panic         = "abort"
+# Performans + binary küçültme
+opt-level     = "z"
+lto           = true
+codegen-units = 1
+strip         = true
