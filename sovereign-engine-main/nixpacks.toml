@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["nodejs_20"]
+nixPkgs = ["nodejs_20", "npm-9_x"]
 
 [phases.install]
 cmds = ["npm install"]
@@ -9,3 +9,6 @@ cmds = ["npm run build"]
 
 [start]
 cmd = "node dist/server/index.js"
+
+[variables]
+NIXPACKS_NODE_VERSION = "20"
