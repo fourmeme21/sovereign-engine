@@ -6,7 +6,7 @@ COPY package*.json ./
 RUN npm install
 
 COPY tsconfig*.json ./
-COPY sovereign-engine-main/ ./sovereign-engine-main/
+COPY sovereign-engine-main/src/ ./src/
 
 RUN npm run build
 
