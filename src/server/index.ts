@@ -80,6 +80,29 @@ function evaluatePatch(patch: PatchInput): { verdict: Verdict; policy: string; r
   return { verdict: 'PERMIT', policy: 'POL-007', reason: 'All checks passed — execution token issued', token }
 }
 
+// ─── MCP Proxy ────────────────────────────────────────────────────────────────
+// MCP_URL → local mcp-server (ngrok tunnel)
+// Ayarlanmamışsa tüm /mcp/* endpoint'leri MCP_NOT_CONFIGURED döner.
+
+const MCP_URL = process.env['MCP_URL'] ?? ''
+
+async function mcpProxy(subpath: string, body?: unknown) {
+  if (!MCP_URL) return { ok: false, error: 'MCP_NOT_CONFIGURED', hint: 'Set MCP_URL env variable to your local mcp-server ngrok URL' }
+  try {
+    const res = await fetch(`${MCP_URL}${subpath}`, {
+      method: body ? 'POST' : 'GET',
+      headers: { 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    })
+    const data = await res.json()
+    return { ok: res.ok, ...data }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return { ok: false, error: 'MCP_UNREACHABLE', hint: msg }
+  }
+}
+// ──────────────────────────────────────────────────────────────────────────────
+
 const app = express()
 app.use(cors({ origin: '*', methods: ['GET', 'POST'] }))
 app.use(express.json({ limit: '1mb' }))
@@ -121,6 +144,7 @@ app.get('/api/session', (_, res) => {
       { id: 'ISSUE-001', level: 'warning', desc: 'execution_token JWT secret yönetimi belirsiz' },
       { id: 'ISSUE-006', level: 'warning', desc: 'CLI testleri test.skip — ESM mock kısıtlaması' },
     ],
+    mcp: { configured: !!MCP_URL, url: MCP_URL || null },
   })
 })
 
@@ -144,6 +168,34 @@ app.post('/api/apply', (req, res) => {
   res.json(decision)
 })
 
+// ─── MCP Endpoint'leri ────────────────────────────────────────────────────────
+
+// GET /mcp/status — MCP server sağlık kontrolü
+app.get('/mcp/status', async (_, res) => {
+  const result = await mcpProxy('/status')
+  res.json(result)
+})
+
+// POST /mcp/sync — SE OS belgelerini NotebookLM'e gönder
+// Body: { files?: string[] }  (opsiyonel — belirtilmezse varsayılan liste kullanılır)
+app.post('/mcp/sync', async (req, res) => {
+  const body = req.body as { files?: string[] }
+  const result = await mcpProxy('/sync', body)
+  res.json(result)
+})
+
+// POST /mcp/query — NotebookLM'e soru sor
+// Body: { question: string }
+app.post('/mcp/query', async (req, res) => {
+  const body = req.body as { question?: string }
+  if (!body?.question)
+    return res.status(400).json({ error: 'question field required' })
+  const result = await mcpProxy('/query', body)
+  res.json(result)
+})
+
+// ──────────────────────────────────────────────────────────────────────────────
+
 const server = http.createServer(app)
 const wss = new WebSocketServer({ server })
 
@@ -160,4 +212,5 @@ wss.on('connection', (ws) => {
 const PORT = parseInt(process.env['PORT'] ?? '8080', 10)
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Sovereign Engine server :${PORT}`)
+  console.log(`🔗 MCP_URL: ${MCP_URL || '⚠️  not configured'}`)
 })
