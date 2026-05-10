@@ -1,23 +1,21 @@
 {
   "name": "sovereign-engine-os",
   "version": "3.0.0",
-  "description": "Sovereign Engine OS — TypeScript tip sistemi ve CLI katmanı",
+  "description": "Sovereign Engine OS",
   "type": "module",
   "engines": {
     "node": ">=20.0.0"
   },
   "scripts": {
-    "build": "tsc",
-    "build:watch": "tsc --watch",
-    "typecheck": "tsc --noEmit",
-    "test": "node --experimental-vm-modules node_modules/.bin/jest",
-    "start": "node dist/server/index.js"
+    "build": "echo 'no build needed'",
+    "start": "node --loader ts-node/esm src/server/index.ts"
   },
   "dependencies": {
     "express": "^4.19.2",
     "ws": "^8.17.1",
     "cors": "^2.8.5",
-    "uuid": "^9.0.1"
+    "uuid": "^9.0.1",
+    "ts-node": "^10.9.2"
   },
   "devDependencies": {
     "typescript": "^5.4.0",
