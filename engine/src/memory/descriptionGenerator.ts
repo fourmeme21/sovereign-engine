@@ -16,6 +16,9 @@ export async function generateFileLevelSummary(
 }
 
 export async function generateChunkDescription(chunk: ASTChunk): Promise<string> {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return `${chunk.type} ${chunk.name} (${chunk.startLine}-${chunk.endLine} satır)`;
+  }
   const response = await client.messages.create({
     model: "claude-sonnet-4-20250514",
     max_tokens: 200,
