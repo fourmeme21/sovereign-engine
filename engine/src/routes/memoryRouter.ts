@@ -121,9 +121,13 @@ async function generateContinuityBriefing(projectId: string, lastSessionAt: Date
     .order("confidence", { ascending: false })
     .limit(5);
 
-  const { data: zones } = await supabase.rpc("get_active_development_zones", { p_project_id: projectId, p_days: 14 }).catch(() => ({ data: null }));
+  
   const activeZone = (zones as any)?.[0]?.directory || "Belirlenemedi";
-
+let zones = null;
+try {
+  const { data } = await supabase.rpc("get_active_development_zones", { p_project_id: projectId, p_days: 14 });
+  zones = data;
+} catch { zones = null; }
   const { data: decisions } = await supabase
     .from("memory_chunks")
     .select("id, content")
