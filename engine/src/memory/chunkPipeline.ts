@@ -32,6 +32,8 @@ export async function processFileUpload(
   const existingFile = await findExistingChunk(projectId, filePath, "architecture");
 
   if (existingFile?.metadata?.content_hash !== fileHash) {
+    const [fileEmbedResult] = await embedTexts([fileSummary], "document");
+    totalTokenCost += fileEmbedResult.tokenCount;
     await upsertChunk({
       projectId,
       commitSha,
@@ -39,6 +41,7 @@ export async function processFileUpload(
       memoryType: "architecture",
       content: fileSummary,
       sourcePath: filePath,
+      embedding: fileEmbedResult.embedding,
       metadata: { level: 1, content_hash: fileHash },
     });
     chunksCreated++;
