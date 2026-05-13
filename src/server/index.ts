@@ -9,6 +9,7 @@ import path from 'path'
 import crypto from 'crypto'
 import { createClient } from '@supabase/supabase-js'
 import memoryRouter from '../../engine/src/routes/memoryRouter.js'
+import { processFileUpload } from '../../engine/src/memory/chunkPipeline.js'
 
 const supabase = createClient(
   process.env['SUPABASE_URL']!,
@@ -176,6 +177,40 @@ app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
           committed_at: commit.timestamp,
         })
         if (insertError) console.error('[webhook] insert error:', insertError.message)
+
+        // ── Semantik diff (deleted dosyalar atlanır) ──
+        if (type !== 'deleted') {
+          void (async () => {
+            try {
+              const rawBase = `https://raw.githubusercontent.com/${payload.repository.full_name}`
+              const [afterRes, beforeRes] = await Promise.allSettled([
+                fetch(`${rawBase}/${commit.id}/${file}`),
+                fetch(`${rawBase}/${commit.id}~1/${file}`),
+              ])
+
+              const afterContent = afterRes.status === 'fulfilled' && afterRes.value.ok
+                ? await afterRes.value.text()
+                : null
+
+              if (!afterContent) return
+
+              const beforeContent = beforeRes.status === 'fulfilled' && beforeRes.value.ok
+                ? await beforeRes.value.text()
+                : ""
+
+              await processFileUpload(
+                PROJECT_ID,
+                file,
+                afterContent,
+                commit.id,
+                branch,
+                beforeContent,
+              )
+            } catch (err) {
+              console.error(`[webhook diff] ${file}`, err)
+            }
+          })()
+        }
       }
     }
   }
