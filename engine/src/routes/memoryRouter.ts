@@ -60,7 +60,7 @@ router.post("/session/open", async (req, res) => {
   if (!project_id) return res.status(400).json({ error: "project_id zorunlu" });
 
   const { data: lastSession } = await supabase
-    .from("sessions")
+    .from("dev_sessions")
     .select("ended_at")
     .eq("project_id", project_id)
     .not("ended_at", "is", null)
@@ -71,7 +71,7 @@ router.post("/session/open", async (req, res) => {
   const lastSessionAt = lastSession?.ended_at ? new Date(lastSession.ended_at) : null;
 
   const { data: newSession } = await supabase
-    .from("sessions")
+    .from("dev_sessions")
     .insert({ project_id, started_at: new Date().toISOString() })
     .select("id")
     .single();
