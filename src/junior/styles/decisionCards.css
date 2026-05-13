@@ -1,0 +1,105 @@
+/* ── Karar Paneli ─────────────────────────────────────────── */
+.karar-panel { display: flex; flex-direction: column; height: 100%; }
+
+.karar-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+}
+
+.karar-list { flex: 1; overflow-y: auto; padding: 10px; }
+
+.karar-empty {
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: center;
+  padding: 24px 0;
+}
+
+/* ── Silent Dot ───────────────────────────────────────────── */
+.silent-dot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.dot-green {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--success);
+  animation: pulse-green 2s infinite;
+}
+
+@keyframes pulse-green {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+
+/* ── Karar Kartı ──────────────────────────────────────────── */
+.decision-card {
+  border-radius: 8px;
+  padding: 14px;
+  margin-bottom: 10px;
+  border-left: 4px solid transparent;
+}
+
+.card-yellow {
+  background: rgba(245, 158, 11, 0.08);
+  border-left-color: var(--warning);
+}
+
+.card-red {
+  background: rgba(239, 68, 68, 0.08);
+  border-left-color: var(--danger);
+}
+
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.card-score   { font-size: 12px; color: var(--text-secondary); }
+.card-area    { font-size: 13px; font-weight: 500; margin-bottom: 4px; }
+.card-label   { font-size: 13px; color: var(--text-secondary); line-height: 1.5; }
+
+.card-actions { display: flex; gap: 8px; margin-top: 12px; }
+
+.btn-approve {
+  padding: 6px 14px; border-radius: 6px;
+  background: var(--success); color: #000;
+  font-size: 13px; font-weight: 600; border: none; cursor: pointer;
+}
+
+.btn-reject {
+  padding: 6px 14px; border-radius: 6px;
+  background: transparent; color: var(--danger);
+  border: 1px solid var(--danger); font-size: 13px; cursor: pointer;
+}
+
+.btn-why {
+  padding: 6px 12px; border-radius: 6px;
+  background: transparent; color: var(--text-secondary);
+  border: 1px solid var(--border); font-size: 12px;
+  cursor: pointer; margin-left: auto;
+}
+
+.card-time { margin-top: 8px; font-size: 11px; color: var(--text-tertiary); }
+
+/* ── Risk Detay ───────────────────────────────────────────── */
+.risk-detail  { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.detail-title { font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 8px; }
+
+.factor-row   { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; }
+.factor-label { width: 160px; color: var(--text-secondary); }
+.factor-bar-wrap { flex: 1; height: 6px; background: var(--border); border-radius: 3px; }
+.factor-bar   { height: 6px; border-radius: 3px; transition: width 0.3s; }
+.factor-score { width: 32px; text-align: right; color: var(--text-secondary); }
