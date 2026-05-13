@@ -5,6 +5,7 @@ import cors from 'cors'
 import { v4 as uuid } from 'uuid'
 import { execSync } from 'child_process'
 import fs from 'fs'
+import path from 'path'
 import crypto from 'crypto'
 import { createClient } from '@supabase/supabase-js'
 
@@ -12,7 +13,6 @@ const supabase = createClient(
   process.env['SUPABASE_URL']!,
   process.env['SUPABASE_SERVICE_KEY']!
 )
-import path from 'path'
 
 export type Verdict = 'PERMIT' | 'DENY' | 'ASK_HUMAN'
 export type Criticality = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
@@ -88,9 +88,6 @@ function evaluatePatch(patch: PatchInput): { verdict: Verdict; policy: string; r
 }
 
 // ─── MCP Proxy ────────────────────────────────────────────────────────────────
-// MCP_URL → local mcp-server (ngrok tunnel)
-// Ayarlanmamışsa tüm /mcp/* endpoint'leri MCP_NOT_CONFIGURED döner.
-
 const MCP_URL = process.env['MCP_URL'] ?? ''
 
 async function mcpProxy(subpath: string, body?: unknown) {
@@ -112,6 +109,70 @@ async function mcpProxy(subpath: string, body?: unknown) {
 
 const app = express()
 app.use(cors({ origin: '*', methods: ['GET', 'POST'] }))
+
+// ─── GitHub Webhook ───────────────────────────────────────────────────────────
+app.post('/webhooks/github', express.raw({ type: 'application/json' }), async (req, res) => {
+  const signature = req.headers['x-hub-signature-256'] as string ?? ''
+  const secret = process.env['GITHUB_WEBHOOK_SECRET'] ?? ''
+  const hmac = crypto.createHmac('sha256', secret)
+  const digest = 'sha256=' + hmac.update(req.body).digest('hex')
+
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature)))
+      return res.status(401).json({ error: 'Invalid signature' })
+  } catch {
+    return res.status(401).json({ error: 'Invalid signature' })
+  }
+
+  const event = req.headers['x-github-event'] as string
+  const payload = JSON.parse(req.body.toString())
+
+  if (event === 'push') {
+    const { commits, repository, ref } = payload
+    const branch = ref.replace('refs/heads/', '')
+
+    for (const commit of commits) {
+      await supabase.from('commit_index').upsert({
+        commit_hash: commit.id,
+        parent_hash: commit.parents?.[0]?.sha ?? null,
+        message: commit.message,
+        author: commit.author.name,
+        timestamp: commit.timestamp,
+        files_changed: {
+          added: commit.added ?? [],
+          modified: commit.modified ?? [],
+          deleted: commit.removed ?? [],
+        },
+        branch,
+        architectural_impact_score: [
+          ...( commit.modified ?? []),
+          ...( commit.added ?? []),
+        ].some((f: string) =>
+          ['auth','payment','security','middleware','schema'].some(p => f.toLowerCase().includes(p))
+        ) ? 0.8 : 0.3,
+      })
+
+      const allFiles = [
+        ...(commit.added ?? []).map((f: string) => ({ file: f, type: 'added' })),
+        ...(commit.modified ?? []).map((f: string) => ({ file: f, type: 'modified' })),
+        ...(commit.removed ?? []).map((f: string) => ({ file: f, type: 'deleted' })),
+      ]
+
+      for (const { file, type } of allFiles) {
+        await supabase.from('commit_file_changes').insert({
+          commit_hash: commit.id,
+          file_path: file,
+          change_type: type,
+          committed_at: commit.timestamp,
+        })
+      }
+    }
+  }
+
+  res.status(200).json({ ok: true })
+})
+// ──────────────────────────────────────────────────────────────────────────────
+
 app.use(express.json({ limit: '1mb' }))
 
 app.get('/health', (_, res) => res.json({ status: 'ok', decisions: decisionStore.length, uptime: process.uptime() }))
@@ -176,23 +237,17 @@ app.post('/api/apply', (req, res) => {
 })
 
 // ─── MCP Endpoint'leri ────────────────────────────────────────────────────────
-
-// GET /mcp/status — MCP server sağlık kontrolü
 app.get('/mcp/status', async (_, res) => {
   const result = await mcpProxy('/status')
   res.json(result)
 })
 
-// POST /mcp/sync — SE OS belgelerini NotebookLM'e gönder
-// Body: { files?: string[] }  (opsiyonel — belirtilmezse varsayılan liste kullanılır)
 app.post('/mcp/sync', async (req, res) => {
   const body = req.body as { files?: string[] }
   const result = await mcpProxy('/sync', body)
   res.json(result)
 })
 
-// POST /mcp/query — NotebookLM'e soru sor
-// Body: { question: string }
 app.post('/mcp/query', async (req, res) => {
   const body = req.body as { question?: string }
   if (!body?.question)
@@ -200,7 +255,6 @@ app.post('/mcp/query', async (req, res) => {
   const result = await mcpProxy('/query', body)
   res.json(result)
 })
-
 // ──────────────────────────────────────────────────────────────────────────────
 
 const server = http.createServer(app)
