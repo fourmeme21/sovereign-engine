@@ -135,13 +135,15 @@ app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
   // Hemen 200 dön — GitHub timeout yemesin
   res.status(200).json({ ok: true })
 
-  // Arka planda işle
+  // Arka planda işle - düzeltilmiş Supabase v2 uyumlu kod
   if (event === 'push') {
     const { commits, ref } = payload
     const branch = ref.replace('refs/heads/', '')
 
+    // for...of ile asenkron güvenli döngü
     for (const commit of commits) {
-      supabase.from('commit_index').upsert({
+      // Upsert işlemi
+      const { error: upsertError } = await supabase.from('commit_index').upsert({
         commit_hash: commit.id,
         parent_hash: commit.parents?.[0]?.sha ?? null,
         message: commit.message,
@@ -159,7 +161,11 @@ app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
         ].some((f: string) =>
           ['auth','payment','security','middleware','schema'].some(p => f.toLowerCase().includes(p))
         ) ? 0.8 : 0.3,
-      }).catch((err: unknown) => console.error('[webhook] upsert error:', err))
+      })
+
+      if (upsertError) {
+        console.error('[webhook] upsert error for commit', commit.id, ':', upsertError.message)
+      }
 
       const allFiles = [
         ...(commit.added ?? []).map((f: string) => ({ file: f, type: 'added' })),
@@ -168,12 +174,15 @@ app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
       ]
 
       for (const { file, type } of allFiles) {
-        supabase.from('commit_file_changes').insert({
+        const { error: insertError } = await supabase.from('commit_file_changes').insert({
           commit_hash: commit.id,
           file_path: file,
           change_type: type,
           committed_at: commit.timestamp,
-        }).catch((err: unknown) => console.error('[webhook] insert error:', err))
+        })
+        if (insertError) {
+          console.error('[webhook] insert error for file', file, 'in commit', commit.id, ':', insertError.message)
+        }
       }
     }
   }
