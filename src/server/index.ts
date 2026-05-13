@@ -8,12 +8,15 @@ import fs from 'fs'
 import path from 'path'
 import crypto from 'crypto'
 import { createClient } from '@supabase/supabase-js'
-import memoryRouter from '../../engine/src/routes/memoryRouter'
+import memoryRouter from '../../engine/src/routes/memoryRouter.js'
+import 'dotenv/config'
 
 const supabase = createClient(
   process.env['SUPABASE_URL']!,
   process.env['SUPABASE_SERVICE_KEY']!
 )
+
+const PROJECT_ID = process.env['PROJECT_ID'] || '39fab005-0000-0000-0000-000000000000'
 
 export type Verdict = 'PERMIT' | 'DENY' | 'ASK_HUMAN'
 export type Criticality = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
@@ -88,7 +91,6 @@ function evaluatePatch(patch: PatchInput): { verdict: Verdict; policy: string; r
   return { verdict: 'PERMIT', policy: 'POL-007', reason: 'All checks passed — execution token issued', token }
 }
 
-// ─── MCP Proxy ────────────────────────────────────────────────────────────────
 const MCP_URL = process.env['MCP_URL'] ?? ''
 
 async function mcpProxy(subpath: string, body?: unknown) {
@@ -106,12 +108,10 @@ async function mcpProxy(subpath: string, body?: unknown) {
     return { ok: false, error: 'MCP_UNREACHABLE', hint: msg }
   }
 }
-// ──────────────────────────────────────────────────────────────────────────────
 
 const app = express()
 app.use(cors({ origin: '*', methods: ['GET', 'POST'] }))
 
-// ─── GitHub Webhook ───────────────────────────────────────────────────────────
 app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
   const signature = (req.headers['x-hub-signature-256'] as string) ?? ''
   const secret    = process.env['GITHUB_WEBHOOK_SECRET'] ?? ''
@@ -132,18 +132,15 @@ app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
   const event   = req.headers['x-github-event'] as string
   const payload = JSON.parse(rawBody.toString())
 
-  // Hemen 200 dön — GitHub timeout yemesin
   res.status(200).json({ ok: true })
 
-  // Arka planda işle - düzeltilmiş Supabase v2 uyumlu kod
   if (event === 'push') {
     const { commits, ref } = payload
     const branch = ref.replace('refs/heads/', '')
 
-    // for...of ile asenkron güvenli döngü
     for (const commit of commits) {
-      // Upsert işlemi
       const { error: upsertError } = await supabase.from('commit_index').upsert({
+        project_id: PROJECT_ID,
         commit_hash: commit.id,
         parent_hash: commit.parents?.[0]?.sha ?? null,
         message: commit.message,
@@ -163,9 +160,7 @@ app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
         ) ? 0.8 : 0.3,
       })
 
-      if (upsertError) {
-        console.error('[webhook] upsert error for commit', commit.id, ':', upsertError.message)
-      }
+      if (upsertError) console.error('[webhook] upsert error:', upsertError.message)
 
       const allFiles = [
         ...(commit.added ?? []).map((f: string) => ({ file: f, type: 'added' })),
@@ -175,19 +170,17 @@ app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
 
       for (const { file, type } of allFiles) {
         const { error: insertError } = await supabase.from('commit_file_changes').insert({
+          project_id: PROJECT_ID,
           commit_hash: commit.id,
           file_path: file,
           change_type: type,
           committed_at: commit.timestamp,
         })
-        if (insertError) {
-          console.error('[webhook] insert error for file', file, 'in commit', commit.id, ':', insertError.message)
-        }
+        if (insertError) console.error('[webhook] insert error:', insertError.message)
       }
     }
   }
 })
-// ──────────────────────────────────────────────────────────────────────────────
 
 app.use(express.json({ limit: '1mb' }))
 
@@ -252,7 +245,6 @@ app.post('/api/apply', (req, res) => {
   res.json(decision)
 })
 
-// ─── MCP Endpoint'leri ────────────────────────────────────────────────────────
 app.get('/mcp/status', async (_, res) => {
   const result = await mcpProxy('/status')
   res.json(result)
@@ -271,11 +263,8 @@ app.post('/mcp/query', async (req, res) => {
   const result = await mcpProxy('/query', body)
   res.json(result)
 })
-// ──────────────────────────────────────────────────────────────────────────────
 
-// ─── Memory Endpoints ─────────────────────────────────────────────────────────
 app.use('/memory', memoryRouter)
-// ──────────────────────────────────────────────────────────────────────────────
 
 const server = http.createServer(app)
 const wss = new WebSocketServer({ server })
@@ -295,4 +284,3 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Sovereign Engine server :${PORT}`)
   console.log(`🔗 MCP_URL: ${MCP_URL || '⚠️  not configured'}`)
 })
-// Session 16 webhook test
