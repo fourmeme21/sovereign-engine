@@ -3,7 +3,6 @@ import { ASTChunk } from "./astParser.js";
 
 const client = new Anthropic();
 
-// TEK VE DOĞRU TANIM – SADECE BURADA
 export async function generateFileLevelSummary(
   filePath: string,
   fileContent: string,
@@ -22,16 +21,7 @@ export async function generateChunkDescription(chunk: ASTChunk): Promise<string>
     max_tokens: 200,
     messages: [{
       role: "user",
-      content: `Aşağıdaki ${chunk.type} için kısa, aranabilir açıklama yaz.
-
-Dosya: ${chunk.filePath}
-${chunk.enclosingClass ? `Sınıf: ${chunk.enclosingClass}` : ""}
-İlgili importlar: ${chunk.imports.slice(0, 3).join(", ")}
-
-Kod:
-${chunk.body.slice(0, 500)}
-
-Açıklama (2-3 cümle):`,
+      content: `Açıklama: ${chunk.type} ${chunk.name} ...`,
     }],
   });
   return (response.content[0] as any).text;
