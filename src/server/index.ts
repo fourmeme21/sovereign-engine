@@ -111,21 +111,25 @@ const app = express()
 app.use(cors({ origin: '*', methods: ['GET', 'POST'] }))
 
 // ─── GitHub Webhook ───────────────────────────────────────────────────────────
-app.post('/webhooks/github', express.raw({ type: 'application/json' }), async (req, res) => {
-  const signature = req.headers['x-hub-signature-256'] as string ?? ''
-  const secret = process.env['GITHUB_WEBHOOK_SECRET'] ?? ''
-  const hmac = crypto.createHmac('sha256', secret)
-  const digest = 'sha256=' + hmac.update(req.body).digest('hex')
+app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
+  const signature = (req.headers['x-hub-signature-256'] as string) ?? ''
+  const secret    = process.env['GITHUB_WEBHOOK_SECRET'] ?? ''
+
+  const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body)
+  const digest  = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex')
+
+  const digestBuf = Buffer.from(digest)
+  const sigBuf    = Buffer.from(signature)
 
   try {
-    if (!crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature)))
+    if (digestBuf.length !== sigBuf.length || !crypto.timingSafeEqual(digestBuf, sigBuf))
       return res.status(401).json({ error: 'Invalid signature' })
   } catch {
     return res.status(401).json({ error: 'Invalid signature' })
   }
 
   const event = req.headers['x-github-event'] as string
-  const payload = JSON.parse(req.body.toString())
+  const payload = JSON.parse(rawBody.toString())
 
   if (event === 'push') {
     const { commits, repository, ref } = payload
