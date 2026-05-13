@@ -8,6 +8,7 @@ import fs from 'fs'
 import path from 'path'
 import crypto from 'crypto'
 import { createClient } from '@supabase/supabase-js'
+import memoryRouter from '../../engine/src/routes/memoryRouter'
 
 const supabase = createClient(
   process.env['SUPABASE_URL']!,
@@ -261,6 +262,10 @@ app.post('/mcp/query', async (req, res) => {
   const result = await mcpProxy('/query', body)
   res.json(result)
 })
+// ──────────────────────────────────────────────────────────────────────────────
+
+// ─── Memory Endpoints ─────────────────────────────────────────────────────────
+app.use('/memory', memoryRouter)
 // ──────────────────────────────────────────────────────────────────────────────
 
 const server = http.createServer(app)
