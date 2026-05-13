@@ -5,6 +5,13 @@ import cors from 'cors'
 import { v4 as uuid } from 'uuid'
 import { execSync } from 'child_process'
 import fs from 'fs'
+import crypto from 'crypto'
+import { createClient } from '@supabase/supabase-js'
+
+const supabase = createClient(
+  process.env['SUPABASE_URL']!,
+  process.env['SUPABASE_SERVICE_KEY']!
+)
 import path from 'path'
 
 export type Verdict = 'PERMIT' | 'DENY' | 'ASK_HUMAN'
