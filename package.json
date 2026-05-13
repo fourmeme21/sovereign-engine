@@ -15,7 +15,8 @@
     "ws": "^8.17.1",
     "cors": "^2.8.5",
     "uuid": "^9.0.1",
-    "ts-node": "^10.9.2"
+    "ts-node": "^10.9.2",
+    "@supabase/supabase-js": "^2.43.0"
   },
   "devDependencies": {
     "typescript": "^5.4.0",
