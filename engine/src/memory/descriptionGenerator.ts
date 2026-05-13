@@ -3,7 +3,6 @@ import { ASTChunk } from "./astParser.js";
 
 const client = new Anthropic();
 
-// 🆕 Eksik olan fonksiyon – dosya seviyesinde özet üretir
 export async function generateFileLevelSummary(
   filePath: string,
   fileContent: string,
@@ -16,7 +15,6 @@ export async function generateFileLevelSummary(
   return `${filePath} (${totalLines} satır, ${functionCount} fonksiyon, ${classCount} sınıf, ${todoCount} TODO/FIXME)`;
 }
 
-// Mevcut fonksiyon – değişmedi
 export async function generateChunkDescription(chunk: ASTChunk): Promise<string> {
   const response = await client.messages.create({
     model: "claude-sonnet-4-20250514",
