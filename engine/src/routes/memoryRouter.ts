@@ -3,6 +3,9 @@ import { supabase } from "../lib/supabase.js";
 import { processFileUpload } from "../memory/chunkPipeline.js";
 import { embedSingle } from "../memory/voyageClient.js";
 import { runSessionClose } from "../workers/sessionSummaryWorker.js";
+import { createTrace, advanceTrace } from "../lib/traceContext.js";
+import { writeAudit } from "../lib/auditWriter.js";
+import { evaluateDiffPolicy } from "../policy/policyWithDiff.js";
 
 const router = express.Router();
 
@@ -10,11 +13,77 @@ router.post("/upload", async (req, res) => {
   const { project_id, file_name, content, commit_sha, branch = "main" } = req.body;
   if (!project_id || !file_name || !content)
     return res.status(400).json({ error: "project_id, file_name, content zorunlu" });
+
+  // Trace başlat
+  const trace = createTrace(project_id);
+
   try {
-    const result = await processFileUpload(project_id, file_name, content, commit_sha, branch);
-    res.json({ success: true, file: file_name, chunks_created: result.chunksCreated, chunks_skipped: result.chunksSkipped, estimated_token_cost: result.tokenCost });
+    // 1. Chunk pipeline
+    const result = await processFileUpload(
+      project_id,
+      file_name,
+      content,
+      commit_sha,
+      branch,
+      undefined,          // beforeContent — direkt upload'da yok, webhook'tan gelir
+      trace.trace_id,     // traceId pipeline boyunca taşınır
+    );
+
+    // 2. Diff varsa policy değerlendir
+    let policyResult = {
+      verdict: "PERMIT" as const,
+      reason: "Diff üretilemedi — doğrudan upload",
+      policy_id: "POL-000",
+      requires_human: false,
+    };
+
+    if (result.semanticDiffId) {
+      const advancedTrace = advanceTrace(trace, "DIFF_GENERATED");
+
+      // Diff'i DB'den çek (policyWithDiff SemanticDiff objesi bekliyor)
+      const { data: diff } = await supabase
+        .from("semantic_diffs")
+        .select("*")
+        .eq("id", result.semanticDiffId)
+        .single();
+
+      if (diff) {
+        const policyTrace = advanceTrace(advancedTrace, "POLICY_EVALUATED");
+        policyResult = await evaluateDiffPolicy(diff, project_id);
+
+        // 3. Audit yaz
+        await writeAudit(policyTrace, {
+          stage: "POLICY_EVALUATED",
+          decision: policyResult.verdict,
+          reason: policyResult.reason,
+          diff_id: diff.id,
+          risk_score: diff.risk_score,
+          metadata: { file: file_name, policy_id: policyResult.policy_id },
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      file: file_name,
+      chunks_created: result.chunksCreated,
+      chunks_skipped: result.chunksSkipped,
+      estimated_token_cost: result.tokenCost,
+      // Yeni alanlar (18B):
+      trace_id: trace.trace_id,
+      risk_score: result.riskScore,
+      policy_verdict: policyResult.verdict,
+      policy_reason: policyResult.reason,
+      requires_human: policyResult.requires_human,
+    });
+
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    await writeAudit(trace, {
+      stage: "REQUEST_RECEIVED",
+      decision: "DENY",
+      reason: err.message,
+    });
+    res.status(500).json({ error: err.message, trace_id: trace.trace_id });
   }
 });
 
@@ -121,7 +190,6 @@ async function generateContinuityBriefing(projectId: string, lastSessionAt: Date
     .order("confidence", { ascending: false })
     .limit(5);
 
-  // ✅ Önce zones'u tanımla
   let zones = null;
   try {
     const { data } = await supabase.rpc("get_active_development_zones", {
@@ -131,7 +199,6 @@ async function generateContinuityBriefing(projectId: string, lastSessionAt: Date
     zones = data;
   } catch { zones = null; }
 
-  // Sonra kullan
   const activeZone = (zones as any)?.[0]?.directory || "Belirlenemedi";
 
   const { data: decisions } = await supabase
@@ -142,6 +209,16 @@ async function generateContinuityBriefing(projectId: string, lastSessionAt: Date
     .eq("is_invalidated", false)
     .order("created_at", { ascending: false })
     .limit(3);
+
+  // ── YENİ (18B): Son yüksek riskli değişiklikler ──────────────────────────
+  const { data: recentHighRisk } = await supabase
+    .from("semantic_diffs")
+    .select("file_path, risk_score, risk_factors, symbols_added, symbols_removed, symbols_modified, generated_at, semantic_summary")
+    .eq("project_id", projectId)
+    .gte("risk_score", 4)
+    .order("generated_at", { ascending: false })
+    .limit(5);
+  // ─────────────────────────────────────────────────────────────────────────
 
   let suggestedFocus = "Kaldığın yerden devam et.";
   if (process.env.ANTHROPIC_API_KEY) {
@@ -165,7 +242,22 @@ async function generateContinuityBriefing(projectId: string, lastSessionAt: Date
     recommended_context_files: (zones as any)?.map((z: any) => z.directory) || [],
     last_decision_ids: (decisions || []).map((d: any) => d.id),
     suggested_focus: suggestedFocus,
+    // ── YENİ (18B) ──
+    recent_risky_changes: (recentHighRisk || []).map((d: any) => ({
+      file: d.file_path,
+      risk_score: d.risk_score,
+      summary: d.semantic_summary || buildQuickSummary(d),
+      when: d.generated_at,
+    })),
   };
+}
+
+function buildQuickSummary(d: any): string {
+  const parts: string[] = [];
+  if (d.symbols_added?.length)    parts.push(`${d.symbols_added.length} eklendi`);
+  if (d.symbols_removed?.length)  parts.push(`${d.symbols_removed.length} silindi`);
+  if (d.symbols_modified?.length) parts.push(`${d.symbols_modified.length} değişti`);
+  return parts.length ? parts.join(", ") : "değişiklik var";
 }
 
 export default router;
