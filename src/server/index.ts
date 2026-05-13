@@ -128,15 +128,19 @@ app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
     return res.status(401).json({ error: 'Invalid signature' })
   }
 
-  const event = req.headers['x-github-event'] as string
+  const event   = req.headers['x-github-event'] as string
   const payload = JSON.parse(rawBody.toString())
 
+  // Hemen 200 dön — GitHub timeout yemesin
+  res.status(200).json({ ok: true })
+
+  // Arka planda işle
   if (event === 'push') {
-    const { commits, repository, ref } = payload
+    const { commits, ref } = payload
     const branch = ref.replace('refs/heads/', '')
 
     for (const commit of commits) {
-      await supabase.from('commit_index').upsert({
+      supabase.from('commit_index').upsert({
         commit_hash: commit.id,
         parent_hash: commit.parents?.[0]?.sha ?? null,
         message: commit.message,
@@ -149,12 +153,12 @@ app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
         },
         branch,
         architectural_impact_score: [
-          ...( commit.modified ?? []),
-          ...( commit.added ?? []),
+          ...(commit.modified ?? []),
+          ...(commit.added ?? []),
         ].some((f: string) =>
           ['auth','payment','security','middleware','schema'].some(p => f.toLowerCase().includes(p))
         ) ? 0.8 : 0.3,
-      })
+      }).catch((err: unknown) => console.error('[webhook] upsert error:', err))
 
       const allFiles = [
         ...(commit.added ?? []).map((f: string) => ({ file: f, type: 'added' })),
@@ -163,17 +167,15 @@ app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
       ]
 
       for (const { file, type } of allFiles) {
-        await supabase.from('commit_file_changes').insert({
+        supabase.from('commit_file_changes').insert({
           commit_hash: commit.id,
           file_path: file,
           change_type: type,
           committed_at: commit.timestamp,
-        })
+        }).catch((err: unknown) => console.error('[webhook] insert error:', err))
       }
     }
   }
-
-  res.status(200).json({ ok: true })
 })
 // ──────────────────────────────────────────────────────────────────────────────
 
