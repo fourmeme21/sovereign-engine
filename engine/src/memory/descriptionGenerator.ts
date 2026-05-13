@@ -37,3 +37,10 @@ Açıklama (2-3 cümle):`,
   });
   return (response.content[0] as any).text;
 }
+export async function generateFileLevelSummary(filePath, fileContent, astChunks) {
+  const totalLines = fileContent.split("\n").length;
+  const functionCount = astChunks.filter(c => c.type === "function").length;
+  const classCount = astChunks.filter(c => c.type === "class").length;
+  const todoCount = astChunks.filter(c => c.hasToDoFixMe).length;
+  return `${filePath} (${totalLines} satır, ${functionCount} fonksiyon, ${classCount} sınıf, ${todoCount} TODO/FIXME)`;
+    }
