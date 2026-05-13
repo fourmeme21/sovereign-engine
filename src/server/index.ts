@@ -9,7 +9,6 @@ import path from 'path'
 import crypto from 'crypto'
 import { createClient } from '@supabase/supabase-js'
 import memoryRouter from '../../engine/src/routes/memoryRouter.js'
-import 'dotenv/config'
 
 const supabase = createClient(
   process.env['SUPABASE_URL']!,
