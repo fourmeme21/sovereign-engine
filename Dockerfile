@@ -6,7 +6,7 @@ COPY package*.json ./
 RUN npm install && npm install tsx
 
 COPY tsconfig*.json ./
-COPY sovereign-engine-main/src/ ./src/
+COPY src/ ./src/
 
 EXPOSE 8080
 
