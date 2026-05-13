@@ -32,7 +32,7 @@ export async function runSessionClose(input: SessionSummaryInput) {
     });
 
     await supabase
-      .from("sessions")
+      .from("dev_sessions")
       .update({ ended_at: new Date().toISOString(), summary })
       .eq("id", input.sessionId);
 
