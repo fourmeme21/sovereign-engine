@@ -3,7 +3,7 @@ FROM node:20-alpine
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm install && npm install tsx
+RUN npm install && npm install tsx @supabase/supabase-js
 
 COPY tsconfig*.json ./
 COPY src/ ./src/
