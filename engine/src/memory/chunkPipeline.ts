@@ -1,7 +1,7 @@
-import { ASTParser } from "./astParser";
-import { generateChunkDescription, generateFileLevelSummary } from "./descriptionGenerator";
-import { embedTexts, contentHash } from "./voyageClient";
-import { supabase } from "../lib/supabase";
+import { ASTParser } from "./astParser.js";
+import { generateChunkDescription, generateFileLevelSummary } from "./descriptionGenerator.js";
+import { embedTexts, contentHash } from "./voyageClient.js";
+import { supabase } from "../lib/supabase.js";
 
 const parser = new ASTParser();
 
@@ -33,7 +33,9 @@ export async function processFileUpload(
 
   if (existingFile?.metadata?.content_hash !== fileHash) {
     await upsertChunk({
-      projectId, commitSha, branch,
+      projectId,
+      commitSha,
+      branch,
       memoryType: "architecture",
       content: fileSummary,
       sourcePath: filePath,
@@ -61,7 +63,9 @@ export async function processFileUpload(
 
       if (existing?.metadata?.content_hash !== chunkHash) {
         await upsertChunk({
-          projectId, commitSha, branch,
+          projectId,
+          commitSha,
+          branch,
           memoryType: "code_semantic",
           content: descriptions[i],
           sourcePath: filePath,
@@ -87,8 +91,9 @@ export async function processFileUpload(
 }
 
 function isTestOrFallback(filePath: string): boolean {
-  return [".test.", ".spec.", "__tests__", "__mocks__", "fallback"]
-    .some((e) => filePath.includes(e));
+  return [".test.", ".spec.", "__tests__", "__mocks__", "fallback"].some((e) =>
+    filePath.includes(e)
+  );
 }
 
 async function findExistingChunk(
