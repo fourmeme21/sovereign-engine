@@ -6,6 +6,7 @@ import { runSessionClose } from "../workers/sessionSummaryWorker.js";
 import { createTrace, advanceTrace } from "../lib/traceContext.js";
 import { writeAudit } from "../lib/auditWriter.js";
 import { evaluateDiffPolicy } from "../policy/policyWithDiff.js";
+import { writeDecisionEvent } from "../memory/incrementalMemory.js";
 
 const router = express.Router();
 
@@ -60,6 +61,21 @@ router.post("/upload", async (req, res) => {
           risk_score: diff.risk_score,
           metadata: { file: file_name, policy_id: policyResult.policy_id },
         });
+
+        // 4. AUTO_APPROVED ise hemen memory chunk yaz
+        if (policyResult.verdict === "AUTO_APPROVED") {
+          await writeDecisionEvent({
+            projectId: project_id,
+            filePath: file_name,
+            riskScore: diff.risk_score ?? 0,
+            traceId: trace.trace_id,
+            action: "AUTO_APPROVED",
+            reason: policyResult.reason,
+            policyId: policyResult.policy_id,
+            phase: "FAZ_M",
+            taskCard: "M-2",
+          });
+        }
       }
     }
 
@@ -161,6 +177,52 @@ router.post("/session/close", async (req, res) => {
       filesEdited: files_edited || [],
     });
   });
+});
+
+// POST /memory/decision
+// Her manuel APPROVE / REJECT anında UI veya MCP katmanından çağrılır
+router.post("/decision", async (req, res) => {
+  const {
+    projectId,
+    filePath,
+    riskScore,
+    traceId,
+    action,
+    reason,
+    policyId,
+    phase,
+    taskCard,
+  } = req.body;
+
+  if (!projectId || !filePath || !action || !reason) {
+    return res.status(400).json({
+      error: "projectId, filePath, action, reason zorunlu",
+    });
+  }
+
+  if (!["APPROVE", "REJECT", "AUTO_APPROVED"].includes(action)) {
+    return res.status(400).json({
+      error: "action: APPROVE | REJECT | AUTO_APPROVED olmalı",
+    });
+  }
+
+  try {
+    await writeDecisionEvent({
+      projectId,
+      filePath,
+      riskScore: riskScore ?? 0,
+      traceId,
+      action,
+      reason,
+      policyId,
+      phase,
+      taskCard,
+    });
+
+    res.json({ success: true, action, filePath });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 async function generateContinuityBriefing(projectId: string, lastSessionAt: Date | null) {
