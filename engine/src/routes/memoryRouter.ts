@@ -15,22 +15,19 @@ router.post("/upload", async (req, res) => {
   if (!project_id || !file_name || !content)
     return res.status(400).json({ error: "project_id, file_name, content zorunlu" });
 
-  // Trace başlat
   const trace = createTrace(project_id);
 
   try {
-    // 1. Chunk pipeline
     const result = await processFileUpload(
       project_id,
       file_name,
       content,
       commit_sha,
       branch,
-      undefined,          // beforeContent — direkt upload'da yok, webhook'tan gelir
-      trace.trace_id,     // traceId pipeline boyunca taşınır
+      undefined,
+      trace.trace_id,
     );
 
-    // 2. Diff varsa policy değerlendir
     let policyResult = {
       verdict: "PERMIT" as const,
       reason: "Diff üretilemedi — doğrudan upload",
@@ -41,7 +38,6 @@ router.post("/upload", async (req, res) => {
     if (result.semanticDiffId) {
       const advancedTrace = advanceTrace(trace, "DIFF_GENERATED");
 
-      // Diff'i DB'den çek (policyWithDiff SemanticDiff objesi bekliyor)
       const { data: diff } = await supabase
         .from("semantic_diffs")
         .select("*")
@@ -52,7 +48,6 @@ router.post("/upload", async (req, res) => {
         const policyTrace = advanceTrace(advancedTrace, "POLICY_EVALUATED");
         policyResult = await evaluateDiffPolicy(diff, project_id);
 
-        // 3. Audit yaz
         await writeAudit(policyTrace, {
           stage: "POLICY_EVALUATED",
           decision: policyResult.verdict,
@@ -62,7 +57,7 @@ router.post("/upload", async (req, res) => {
           metadata: { file: file_name, policy_id: policyResult.policy_id },
         });
 
-        // 4. AUTO_APPROVED ise hemen memory chunk yaz
+        // M-2: AUTO_APPROVED ise hemen memory chunk yaz
         if (policyResult.verdict === "AUTO_APPROVED") {
           await writeDecisionEvent({
             projectId: project_id,
@@ -85,7 +80,6 @@ router.post("/upload", async (req, res) => {
       chunks_created: result.chunksCreated,
       chunks_skipped: result.chunksSkipped,
       estimated_token_cost: result.tokenCost,
-      // Yeni alanlar (18B):
       trace_id: trace.trace_id,
       risk_score: result.riskScore,
       policy_verdict: policyResult.verdict,
@@ -179,46 +173,20 @@ router.post("/session/close", async (req, res) => {
   });
 });
 
-// POST /memory/decision
-// Her manuel APPROVE / REJECT anında UI veya MCP katmanından çağrılır
+// M-2: Manuel APPROVE / REJECT kaydı
 router.post("/decision", async (req, res) => {
-  const {
-    projectId,
-    filePath,
-    riskScore,
-    traceId,
-    action,
-    reason,
-    policyId,
-    phase,
-    taskCard,
-  } = req.body;
+  const { projectId, filePath, riskScore, traceId, action, reason, policyId, phase, taskCard } = req.body;
 
   if (!projectId || !filePath || !action || !reason) {
-    return res.status(400).json({
-      error: "projectId, filePath, action, reason zorunlu",
-    });
+    return res.status(400).json({ error: "projectId, filePath, action, reason zorunlu" });
   }
 
   if (!["APPROVE", "REJECT", "AUTO_APPROVED"].includes(action)) {
-    return res.status(400).json({
-      error: "action: APPROVE | REJECT | AUTO_APPROVED olmalı",
-    });
+    return res.status(400).json({ error: "action: APPROVE | REJECT | AUTO_APPROVED olmalı" });
   }
 
   try {
-    await writeDecisionEvent({
-      projectId,
-      filePath,
-      riskScore: riskScore ?? 0,
-      traceId,
-      action,
-      reason,
-      policyId,
-      phase,
-      taskCard,
-    });
-
+    await writeDecisionEvent({ projectId, filePath, riskScore: riskScore ?? 0, traceId, action, reason, policyId, phase, taskCard });
     res.json({ success: true, action, filePath });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -272,7 +240,6 @@ async function generateContinuityBriefing(projectId: string, lastSessionAt: Date
     .order("created_at", { ascending: false })
     .limit(3);
 
-  // ── YENİ (18B): Son yüksek riskli değişiklikler ──────────────────────────
   const { data: recentHighRisk } = await supabase
     .from("semantic_diffs")
     .select("file_path, risk_score, risk_factors, symbols_added, symbols_removed, symbols_modified, generated_at, semantic_summary")
@@ -280,7 +247,15 @@ async function generateContinuityBriefing(projectId: string, lastSessionAt: Date
     .gte("risk_score", 4)
     .order("generated_at", { ascending: false })
     .limit(5);
-  // ─────────────────────────────────────────────────────────────────────────
+
+  // M-4: Son 10 karar event'i session başında inject et
+  const { data: recentDecisionEvents } = await supabase
+    .from("memory_chunks")
+    .select("content, metadata, created_at")
+    .eq("project_id", projectId)
+    .eq("memory_type", "decision_event")
+    .order("created_at", { ascending: false })
+    .limit(10);
 
   let suggestedFocus = "Kaldığın yerden devam et.";
   if (process.env.ANTHROPIC_API_KEY) {
@@ -304,12 +279,19 @@ async function generateContinuityBriefing(projectId: string, lastSessionAt: Date
     recommended_context_files: (zones as any)?.map((z: any) => z.directory) || [],
     last_decision_ids: (decisions || []).map((d: any) => d.id),
     suggested_focus: suggestedFocus,
-    // ── YENİ (18B) ──
     recent_risky_changes: (recentHighRisk || []).map((d: any) => ({
       file: d.file_path,
       risk_score: d.risk_score,
       summary: d.semantic_summary || buildQuickSummary(d),
       when: d.generated_at,
+    })),
+    // M-4: Son karar event'leri briefing'e eklendi
+    recent_decisions: (recentDecisionEvents || []).map((e: any) => ({
+      action: e.metadata?.action,
+      file: e.metadata?.file_path,
+      risk_score: e.metadata?.risk_score,
+      reason: e.metadata?.reason,
+      when: e.created_at,
     })),
   };
 }
