@@ -10,6 +10,7 @@ import crypto from 'crypto'
 import { createClient } from '@supabase/supabase-js'
 import memoryRouter from '../../engine/src/routes/memoryRouter.js'
 import { processFileUpload } from '../../engine/src/memory/chunkPipeline.js'
+import githubRouter from '../routes/github.js'
 
 const supabase = createClient(
   process.env['SUPABASE_URL']!,
@@ -110,7 +111,7 @@ async function mcpProxy(subpath: string, body?: unknown) {
 }
 
 const app = express()
-app.use(cors({ origin: '*', methods: ['GET', 'POST'] }))
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT'] }))
 
 app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
   const signature = (req.headers['x-hub-signature-256'] as string) ?? ''
@@ -178,7 +179,6 @@ app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
         })
         if (insertError) console.error('[webhook] insert error:', insertError.message)
 
-        // ── Semantik diff (deleted dosyalar atlanır) ──
         if (type !== 'deleted') {
           void (async () => {
             try {
@@ -299,6 +299,7 @@ app.post('/mcp/query', async (req, res) => {
 })
 
 app.use('/memory', memoryRouter)
+app.use('/github', githubRouter)
 
 const server = http.createServer(app)
 const wss = new WebSocketServer({ server })
