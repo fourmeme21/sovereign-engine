@@ -1,307 +1,139 @@
-import express from "express";
-import { supabase } from "../lib/supabase.js";
-import { processFileUpload } from "../memory/chunkPipeline.js";
-import { embedSingle } from "../memory/voyageClient.js";
-import { runSessionClose } from "../workers/sessionSummaryWorker.js";
-import { createTrace, advanceTrace } from "../lib/traceContext.js";
-import { writeAudit } from "../lib/auditWriter.js";
-import { evaluateDiffPolicy } from "../policy/policyWithDiff.js";
-import { writeDecisionEvent } from "../memory/incrementalMemory.js";
+# SOVEREIGN ENGINE — MEMORY SYSTEM SESSION INDEX
 
-const router = express.Router();
+> Bu dosya her session başında Claude'a verilir.
+> Claude bu dosyadan görevi alır, tamamlananları işaretler, devam eder.
 
-router.post("/upload", async (req, res) => {
-  const { project_id, file_name, content, commit_sha, branch = "main" } = req.body;
-  if (!project_id || !file_name || !content)
-    return res.status(400).json({ error: "project_id, file_name, content zorunlu" });
+---
 
-  const trace = createTrace(project_id);
+## ANLIK DURUM
 
-  try {
-    const result = await processFileUpload(
-      project_id,
-      file_name,
-      content,
-      commit_sha,
-      branch,
-      undefined,
-      trace.trace_id,
-    );
+| Alan | Değer |
+|---|---|
+| Proje | sovereign-engine |
+| Aktif Faz | **FAZ M — Memory System Activation** |
+| Genel Durum | 🟡 FAZ M kodları deploy edildi — M-1 kısmen açık |
 
-    let policyResult = {
-      verdict: "PERMIT" as const,
-      reason: "Diff üretilemedi — doğrudan upload",
-      policy_id: "POL-000",
-      requires_human: false,
-    };
+---
 
-    if (result.semanticDiffId) {
-      const advancedTrace = advanceTrace(trace, "DIFF_GENERATED");
+## SİSTEM MİMARİSİ
 
-      const { data: diff } = await supabase
-        .from("semantic_diffs")
-        .select("*")
-        .eq("id", result.semanticDiffId)
-        .single();
+```
+Claude / MCP
+    ↓
+sovereign-engine (Railway) ← engine/src/memory/
+    ↓
+Supabase (pgvector) + Voyage AI
+    ↓
+memory_chunks tablosu
+```
 
-      if (diff) {
-        const policyTrace = advanceTrace(advancedTrace, "POLICY_EVALUATED");
-        policyResult = await evaluateDiffPolicy(diff, project_id);
+**Mevcut çalışan:**
+- ✅ Engine (Railway'de ayakta)
+- ✅ MCP Sunucusu (Claude köprüsü bağlı)
+- ✅ Chunk yazma kodu (`chunkPipeline.ts` yazılmış)
+- ✅ Session summary kodu (`sessionSummaryWorker.ts` güncellendi — M-3)
+- ✅ GitHub token (bağlandı)
+- ✅ `incrementalMemory.ts` yazıldı ve deploy edildi (M-2)
+- ✅ `memoryRouter.ts` session başı inject eklendi (M-4)
+- ✅ `POST /memory/decision` endpoint aktif (M-2)
 
-        await writeAudit(policyTrace, {
-          stage: "POLICY_EVALUATED",
-          decision: policyResult.verdict,
-          reason: policyResult.reason,
-          diff_id: diff.id,
-          risk_score: diff.risk_score,
-          metadata: { file: file_name, policy_id: policyResult.policy_id },
-        });
+**Açık:**
+- ⚠️ Sovereign Memory tam yeşile dönmedi — Voyage AI bağlantısı kontrol edilmeli
 
-        // M-2: AUTO_APPROVED ise hemen memory chunk yaz
-        if (policyResult.verdict === "AUTO_APPROVED") {
-          await writeDecisionEvent({
-            projectId: project_id,
-            filePath: file_name,
-            riskScore: diff.risk_score ?? 0,
-            traceId: trace.trace_id,
-            action: "AUTO_APPROVED",
-            reason: policyResult.reason,
-            policyId: policyResult.policy_id,
-            phase: "FAZ_M",
-            taskCard: "M-2",
-          });
-        }
-      }
-    }
+---
 
-    res.json({
-      success: true,
-      file: file_name,
-      chunks_created: result.chunksCreated,
-      chunks_skipped: result.chunksSkipped,
-      estimated_token_cost: result.tokenCost,
-      trace_id: trace.trace_id,
-      risk_score: result.riskScore,
-      policy_verdict: policyResult.verdict,
-      policy_reason: policyResult.reason,
-      requires_human: policyResult.requires_human,
-    });
+## FAZ M — GÖREV KARTLARI
 
-  } catch (err: any) {
-    await writeAudit(trace, {
-      stage: "REQUEST_RECEIVED",
-      decision: "DENY",
-      reason: err.message,
-    });
-    res.status(500).json({ error: err.message, trace_id: trace.trace_id });
-  }
-});
+### M-1 — Railway Env Variables
+| Alan | Değer |
+|---|---|
+| Durum | ⚠️ KISMI — ANTHROPIC_API_KEY eklendi, Memory yeşile dönmedi |
+| Dosya | Railway dashboard → sovereign-engine → Variables |
+| Risk | YOK — sadece config |
 
-router.post("/query", async (req, res) => {
-  const { project_id, query, top_k = 5, memory_types, branch } = req.body;
-  if (!project_id || !query)
-    return res.status(400).json({ error: "project_id, query zorunlu" });
-  try {
-    const queryEmbedding = await embedSingle(query, "query");
-    const { data, error } = await supabase.rpc("search_memory", {
-      p_query_embedding: JSON.stringify(queryEmbedding),
-      p_project_id: project_id,
-      p_top_k: top_k,
-      p_memory_types: memory_types || null,
-      p_branch: branch || null,
-    });
-    if (error) throw error;
-    if (data?.length) {
-      await supabase.rpc("increment_reference_counts", { chunk_ids: data.map((r: any) => r.id) });
-    }
-    res.json({ results: (data || []).map((row: any) => ({ id: row.id, content: row.content, source_file: row.source_path, memory_type: row.memory_type, similarity: row.similarity, metadata: row.metadata })) });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
+**Yapılan:**
+- `ANTHROPIC_API_KEY` set edildi
+- Diğer key'ler mevcut
 
-router.get("/health/:project_id", async (req, res) => {
-  const { project_id } = req.params;
-  const { data } = await supabase.from("memory_chunks").select("memory_type, confidence, freshness_score").eq("project_id", project_id).eq("is_invalidated", false);
-  const summary = (data || []).reduce((acc: any, row: any) => {
-    if (!acc[row.memory_type]) acc[row.memory_type] = { count: 0, avgConfidence: 0, avgFreshness: 0 };
-    acc[row.memory_type].count++;
-    acc[row.memory_type].avgConfidence += row.confidence;
-    acc[row.memory_type].avgFreshness += row.freshness_score;
-    return acc;
-  }, {});
-  Object.keys(summary).forEach((k) => { summary[k].avgConfidence /= summary[k].count; summary[k].avgFreshness /= summary[k].count; });
-  res.json({ project_id, memory_health: summary });
-});
+**Kalan:**
+- Voyage AI bağlantısı neden yeşile dönmediği araştırılacak
 
-router.post("/session/open", async (req, res) => {
-  const { project_id } = req.body;
-  if (!project_id) return res.status(400).json({ error: "project_id zorunlu" });
+---
 
-  const { data: lastSession } = await supabase
-    .from("dev_sessions")
-    .select("ended_at")
-    .eq("project_id", project_id)
-    .not("ended_at", "is", null)
-    .order("ended_at", { ascending: false })
-    .limit(1)
-    .single();
+### M-2 — Incremental Memory
+| Alan | Değer |
+|---|---|
+| Durum | ✅ TAMAMLANDI — Deploy başarılı |
+| Dosya | `engine/src/memory/incrementalMemory.ts` (YENİ) |
+| Risk | DÜŞÜK |
 
-  const lastSessionAt = lastSession?.ended_at ? new Date(lastSession.ended_at) : null;
+**Yapılan:**
+- `writeDecisionEvent()` fonksiyonu yazıldı
+- Idempotency (trace_id) koruması eklendi
+- `AUTO_APPROVED` → `/upload` endpoint'inde otomatik chunk yazıyor
+- `POST /memory/decision` → manuel APPROVE/REJECT için endpoint eklendi
 
-  const { data: newSession } = await supabase
-    .from("dev_sessions")
-    .insert({ project_id, started_at: new Date().toISOString() })
-    .select("id")
-    .single();
+---
 
-  const briefing = await generateContinuityBriefing(project_id, lastSessionAt);
+### M-3 — Session Collector
+| Alan | Değer |
+|---|---|
+| Durum | ✅ TAMAMLANDI — Deploy başarılı |
+| Dosya | `engine/src/workers/sessionSummaryWorker.ts` (GÜNCELLENDİ) |
+| Risk | DÜŞÜK |
 
-  res.json({ session_id: newSession?.id, briefing });
-});
+**Yapılan:**
+- `fetchSessionDecisionEvents()` eklendi — session başından itibaren karar chunk'larını çeker
+- `generateSessionNarrative()` kararları prompt'a dahil ediyor
+- Metadata'ya `decision_events_count`, `approved_count`, `rejected_count` eklendi
 
-router.post("/session/close", async (req, res) => {
-  const { session_id, project_id, conversation_log, files_edited } = req.body;
-  res.json({ ok: true, message: "Session kapatma başlatıldı." });
-  setImmediate(async () => {
-    await runSessionClose({
-      sessionId: session_id,
-      projectId: project_id,
-      conversationLog: conversation_log || [],
-      filesEdited: files_edited || [],
-    });
-  });
-});
+---
 
-// M-2: Manuel APPROVE / REJECT kaydı
-router.post("/decision", async (req, res) => {
-  const { projectId, filePath, riskScore, traceId, action, reason, policyId, phase, taskCard } = req.body;
+### M-4 — Memory Query Entegrasyonu
+| Alan | Değer |
+|---|---|
+| Durum | ✅ TAMAMLANDI — Deploy başarılı |
+| Dosya | `engine/src/routes/memoryRouter.ts` (GÜNCELLENDİ) |
+| Risk | DÜŞÜK |
 
-  if (!projectId || !filePath || !action || !reason) {
-    return res.status(400).json({ error: "projectId, filePath, action, reason zorunlu" });
-  }
+**Yapılan:**
+- `generateContinuityBriefing()` içine son 10 `decision_event` chunk sorgusu eklendi
+- `/session/open` yanıtına `recent_decisions` alanı eklendi
 
-  if (!["APPROVE", "REJECT", "AUTO_APPROVED"].includes(action)) {
-    return res.status(400).json({ error: "action: APPROVE | REJECT | AUTO_APPROVED olmalı" });
-  }
+---
 
-  try {
-    await writeDecisionEvent({ projectId, filePath, riskScore: riskScore ?? 0, traceId, action, reason, policyId, phase, taskCard });
-    res.json({ success: true, action, filePath });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
+## SIRADAKI GÖREVLER
 
-async function generateContinuityBriefing(projectId: string, lastSessionAt: Date | null) {
-  const now = new Date();
-  const gapDays = lastSessionAt ? Math.floor((now.getTime() - lastSessionAt.getTime()) / (1000 * 60 * 60 * 24)) : 0;
+1. ⚠️ **M-1 takip** — Voyage AI bağlantısı neden yeşile dönmedi araştır
+2. 🧪 **FAZ M test** — `POST /memory/decision` endpoint'ini canlıda test et
+3. 🔵 **FAZ N** — (tanımlanmadı — FAZ M test sonrası planlanacak)
 
-  let gitSummary = "Son sessiondan beri değişiklik yok.";
-  if (gapDays > 0 && lastSessionAt) {
-    const { data: commits } = await supabase
-      .from("commit_index")
-      .select("message, semantic_diff_summary")
-      .eq("project_id", projectId)
-      .gt("timestamp", lastSessionAt.toISOString())
-      .order("timestamp", { ascending: false })
-      .limit(10);
-    if (commits?.length) {
-      gitSummary = `${commits.length} commit: ${commits.map((c: any) => c.semantic_diff_summary || c.message).join("; ")}`;
-    }
-  }
+---
 
-  const { data: threads } = await supabase
-    .from("memory_chunks")
-    .select("id, content, confidence, source_path")
-    .eq("project_id", projectId)
-    .eq("memory_type", "unresolved")
-    .eq("is_invalidated", false)
-    .order("confidence", { ascending: false })
-    .limit(5);
+## KRİTİK TEKNİK KARARLAR
 
-  let zones = null;
-  try {
-    const { data } = await supabase.rpc("get_active_development_zones", {
-      p_project_id: projectId,
-      p_days: 14,
-    });
-    zones = data;
-  } catch { zones = null; }
+| Karar | Sebep |
+|---|---|
+| B yaklaşımı (incremental) önce | Session sonu özetleme güvenilmez — bağlantı kopabilir, 30 mesaj limiti yetersiz |
+| A hafif versiyon B'den sonra | B chunk'larını toplar — Claude'a ham mesaj göndermez, token israfı yok |
+| Chunk'a phase/task_card inject | Memory'den geçmiş kararlar çekilince hangi fazda alındığı bilinir |
+| memoryRouter session başı inject | Claude her session'da bağlamı manuel okumadan alır |
+| Approve/reject endpoint yeni oluşturuldu | github.js'de mevcut değildi — memoryRouter'a eklendi |
 
-  const activeZone = (zones as any)?.[0]?.directory || "Belirlenemedi";
+---
 
-  const { data: decisions } = await supabase
-    .from("memory_chunks")
-    .select("id, content")
-    .eq("project_id", projectId)
-    .eq("memory_type", "decision")
-    .eq("is_invalidated", false)
-    .order("created_at", { ascending: false })
-    .limit(3);
+## AÇIK SORUNLAR
 
-  const { data: recentHighRisk } = await supabase
-    .from("semantic_diffs")
-    .select("file_path, risk_score, risk_factors, symbols_added, symbols_removed, symbols_modified, generated_at, semantic_summary")
-    .eq("project_id", projectId)
-    .gte("risk_score", 4)
-    .order("generated_at", { ascending: false })
-    .limit(5);
+| # | Sorun | Öncelik |
+|---|---|---|
+| 1 | Sovereign Memory yeşile dönmedi | 🟡 M-1 takip |
+| 2 | Memory query `/memory/query` endpoint canlı testi yapılmadı | 🟡 FAZ M test |
 
-  // M-4: Son 10 karar event'i session başında inject et
-  const { data: recentDecisionEvents } = await supabase
-    .from("memory_chunks")
-    .select("content, metadata, created_at")
-    .eq("project_id", projectId)
-    .eq("memory_type", "decision_event")
-    .order("created_at", { ascending: false })
-    .limit(10);
+---
 
-  let suggestedFocus = "Kaldığın yerden devam et.";
-  if (process.env.ANTHROPIC_API_KEY) {
-    try {
-      const { claudeClient } = await import("../lib/claude.js");
-      const response = await claudeClient.messages.create({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 80,
-        messages: [{ role: "user", content: `Proje durumuna göre odaklanılacak en önemli şeyi 1 cümleyle belirt.\nGap: ${gapDays} gün\nGit: ${gitSummary}\nUnresolved: ${(threads || []).map((t: any) => t.content).join(", ")}\nZone: ${activeZone}` }],
-      });
-      suggestedFocus = (response.content[0] as any).text;
-    } catch { }
-  }
+## SESSION LOG
 
-  return {
-    temporal_gap_days: gapDays,
-    git_summary: gitSummary,
-    unresolved_threads: (threads || []).map((t: any) => ({ id: t.id, summary: t.content, confidence: t.confidence, file: t.source_path })),
-    active_zone: activeZone,
-    architectural_drift_detected: false,
-    recommended_context_files: (zones as any)?.map((z: any) => z.directory) || [],
-    last_decision_ids: (decisions || []).map((d: any) => d.id),
-    suggested_focus: suggestedFocus,
-    recent_risky_changes: (recentHighRisk || []).map((d: any) => ({
-      file: d.file_path,
-      risk_score: d.risk_score,
-      summary: d.semantic_summary || buildQuickSummary(d),
-      when: d.generated_at,
-    })),
-    // M-4: Son karar event'leri briefing'e eklendi
-    recent_decisions: (recentDecisionEvents || []).map((e: any) => ({
-      action: e.metadata?.action,
-      file: e.metadata?.file_path,
-      risk_score: e.metadata?.risk_score,
-      reason: e.metadata?.reason,
-      when: e.created_at,
-    })),
-  };
-}
-
-function buildQuickSummary(d: any): string {
-  const parts: string[] = [];
-  if (d.symbols_added?.length)    parts.push(`${d.symbols_added.length} eklendi`);
-  if (d.symbols_removed?.length)  parts.push(`${d.symbols_removed.length} silindi`);
-  if (d.symbols_modified?.length) parts.push(`${d.symbols_modified.length} değişti`);
-  return parts.length ? parts.join(", ") : "değişiklik var";
-}
-
-export default router;
+| Session | Tarih | Konu |
+|---|---|---|
+| 1 | 2026-05-16 | Sistem analizi. Bağlantı sorunu tespit edildi. GitHub token form eklendi. FAZ M planlandı. |
+| 2 | 2026-05-16 | FAZ M kodları yazıldı. M-2 (incrementalMemory.ts), M-3 (sessionSummaryWorker.ts), M-4 (memoryRouter.ts) tamamlandı. Deploy başarılı. |
