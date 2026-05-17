@@ -111,6 +111,7 @@ app.get('/api/decisions', (_, res) => res.json(decisionStore))
 // ─── Şifre Doğrulama ─────────────────────────────────────────────────────────
 app.post('/api/auth/verify-password', async (req, res) => {
   const { password } = req.body
+  console.log('🔑 istek geldi:', req.body)
   if (!password) return res.status(400).json({ error: 'password required' })
 
   const correctPassword = process.env['CHAT_PASSWORD'] ?? 'sql1967'
