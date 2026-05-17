@@ -113,13 +113,9 @@ app.post('/api/auth/verify-password', async (req, res) => {
   const { password } = req.body
   if (!password) return res.status(400).json({ error: 'password required' })
 
-  const { data } = await supabase
-    .from('app_settings')
-    .select('value')
-    .eq('key', 'chat_password')
-    .single()
+  const correctPassword = process.env['CHAT_PASSWORD'] ?? 'sql1967'
 
-  if (data?.value === password) {
+  if (password === correctPassword) {
     const token = `se_${Buffer.from(`${Date.now()}`).toString('base64')}`
     return res.json({ ok: true, token })
   }
