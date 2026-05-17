@@ -6,6 +6,7 @@ import { v4 as uuid } from 'uuid'
 import { execSync } from 'child_process'
 import fs from 'fs'
 import path from 'path'
+import { supabase } from './lib/supabase'
 
 export type Verdict = 'PERMIT' | 'DENY' | 'ASK_HUMAN'
 export type Criticality = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
@@ -81,9 +82,6 @@ function evaluatePatch(patch: PatchInput): { verdict: Verdict; policy: string; r
 }
 
 // ─── MCP Proxy ────────────────────────────────────────────────────────────────
-// MCP_URL → local mcp-server (ngrok tunnel)
-// Ayarlanmamışsa tüm /mcp/* endpoint'leri MCP_NOT_CONFIGURED döner.
-
 const MCP_URL = process.env['MCP_URL'] ?? ''
 
 async function mcpProxy(subpath: string, body?: unknown) {
@@ -109,6 +107,22 @@ app.use(express.json({ limit: '1mb' }))
 
 app.get('/health', (_, res) => res.json({ status: 'ok', decisions: decisionStore.length, uptime: process.uptime() }))
 app.get('/api/decisions', (_, res) => res.json(decisionStore))
+
+// ─── Şifre Doğrulama ─────────────────────────────────────────────────────────
+app.post('/api/auth/verify-password', async (req, res) => {
+  const { password } = req.body
+  if (!password) return res.status(400).json({ error: 'password required' })
+
+  const { data } = await supabase
+    .from('app_settings')
+    .select('value')
+    .eq('key', 'chat_password')
+    .single()
+
+  if (data?.value === password) return res.json({ ok: true })
+  return res.status(401).json({ error: 'wrong password' })
+})
+// ──────────────────────────────────────────────────────────────────────────────
 
 app.get('/api/policies', (_, res) => res.json([
   { id: 'POL-001', label: 'POL-001 · HL-1 · Immutable State',  meta: 'HL-1 · Immutable State Guard · HARD_LOCK',  type: 'HARD_LOCK',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    let immutable = vec!["system.config","audit.log","policy.kernel"];\n    if decision.action == ActionType::ModifyState {\n        for resource in &immutable {\n            if decision.target.contains(resource) {\n                return PolicyResult { verdict: Verdict::Deny, reason: format!("HL-1: Immutable \'{}\' blocked", resource), policy_id: "POL-001", token: None };\n            }\n        }\n    }\n    PolicyResult::pass()\n}' },
@@ -169,23 +183,17 @@ app.post('/api/apply', (req, res) => {
 })
 
 // ─── MCP Endpoint'leri ────────────────────────────────────────────────────────
-
-// GET /mcp/status — MCP server sağlık kontrolü
 app.get('/mcp/status', async (_, res) => {
   const result = await mcpProxy('/status')
   res.json(result)
 })
 
-// POST /mcp/sync — SE OS belgelerini NotebookLM'e gönder
-// Body: { files?: string[] }  (opsiyonel — belirtilmezse varsayılan liste kullanılır)
 app.post('/mcp/sync', async (req, res) => {
   const body = req.body as { files?: string[] }
   const result = await mcpProxy('/sync', body)
   res.json(result)
 })
 
-// POST /mcp/query — NotebookLM'e soru sor
-// Body: { question: string }
 app.post('/mcp/query', async (req, res) => {
   const body = req.body as { question?: string }
   if (!body?.question)
@@ -193,7 +201,6 @@ app.post('/mcp/query', async (req, res) => {
   const result = await mcpProxy('/query', body)
   res.json(result)
 })
-
 // ──────────────────────────────────────────────────────────────────────────────
 
 const server = http.createServer(app)
