@@ -119,7 +119,10 @@ app.post('/api/auth/verify-password', async (req, res) => {
     .eq('key', 'chat_password')
     .single()
 
-  if (data?.value === password) return res.json({ ok: true })
+  if (data?.value === password) {
+    const token = `se_${Buffer.from(`${Date.now()}`).toString('base64')}`
+    return res.json({ ok: true, token })
+  }
   return res.status(401).json({ error: 'wrong password' })
 })
 // ──────────────────────────────────────────────────────────────────────────────
