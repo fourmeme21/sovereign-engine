@@ -22,11 +22,11 @@ export interface WsMessage {
 }
 
 const decisionStore: Decision[] = [
-  { id: 'dec-8a3f2', action: 'MODIFY_STATE',   criticality: 'CRITICAL', verdict: 'ASK_HUMAN', policy: 'POL-011',        reason: 'Low confidence — human required',   token: null,                    time: '14:22:07', latency: '2.1ms' },
-  { id: 'dec-7b1e4', action: 'EXECUTE_ACTION', criticality: 'HIGH',     verdict: 'PERMIT',    policy: 'POL-007',        reason: 'All checks passed — token issued',   token: 'eyJhbGciOiJIUzI1NiJ9', time: '14:21:55', latency: '3.2ms' },
-  { id: 'dec-6c9d1', action: 'READ_STATE',      criticality: 'LOW',      verdict: 'PERMIT',    policy: 'POL-003',        reason: 'Read-only — auto permit',            token: 'eyJhbGciOiJIUzI1NiJ9', time: '14:20:40', latency: '0.8ms' },
+  { id: 'dec-8a3f2', action: 'MODIFY_STATE',   criticality: 'CRITICAL', verdict: 'ASK_HUMAN', policy: 'POL-011',        reason: 'Low confidence - human required',   token: null,                    time: '14:22:07', latency: '2.1ms' },
+  { id: 'dec-7b1e4', action: 'EXECUTE_ACTION', criticality: 'HIGH',     verdict: 'PERMIT',    policy: 'POL-007',        reason: 'All checks passed - token issued',   token: 'eyJhbGciOiJIUzI1NiJ9', time: '14:21:55', latency: '3.2ms' },
+  { id: 'dec-6c9d1', action: 'READ_STATE',      criticality: 'LOW',      verdict: 'PERMIT',    policy: 'POL-003',        reason: 'Read-only - auto permit',            token: 'eyJhbGciOiJIUzI1NiJ9', time: '14:20:40', latency: '0.8ms' },
   { id: 'dec-5d2a8', action: 'MODIFY_STATE',    criticality: 'CRITICAL', verdict: 'DENY',      policy: 'POL-001 (HL-1)', reason: 'HL-1: Immutable resource blocked',   token: null,                    time: '14:18:33', latency: '1.1ms' },
-  { id: 'dec-4e0f3', action: 'EXECUTE_ACTION',  criticality: 'MEDIUM',   verdict: 'PERMIT',    policy: 'POL-007',        reason: 'All checks passed — token issued',   token: 'eyJhbGciOiJIUzI1NiJ9', time: '14:17:12', latency: '2.9ms' },
+  { id: 'dec-4e0f3', action: 'EXECUTE_ACTION',  criticality: 'MEDIUM',   verdict: 'PERMIT',    policy: 'POL-007',        reason: 'All checks passed - token issued',   token: 'eyJhbGciOiJIUzI1NiJ9', time: '14:17:12', latency: '2.9ms' },
 ]
 
 const MAX_DECISIONS = 200
@@ -78,10 +78,10 @@ function evaluatePatch(patch: PatchInput): { verdict: Verdict; policy: string; r
   } catch (_) {}
 
   const token = `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ id: uuid(), exp: Date.now() + 30_000 })).toString('base64url')}`
-  return { verdict: 'PERMIT', policy: 'POL-007', reason: 'All checks passed — execution token issued', token }
+  return { verdict: 'PERMIT', policy: 'POL-007', reason: 'All checks passed - execution token issued', token }
 }
 
-// ─── MCP Proxy ────────────────────────────────────────────────────────────────
+// MCP Proxy
 const MCP_URL = process.env['MCP_URL'] ?? ''
 
 async function mcpProxy(subpath: string, body?: unknown) {
@@ -99,19 +99,27 @@ async function mcpProxy(subpath: string, body?: unknown) {
     return { ok: false, error: 'MCP_UNREACHABLE', hint: msg }
   }
 }
-// ──────────────────────────────────────────────────────────────────────────────
 
 const app = express()
-app.use(cors())
+
+// CORS - sadece kendi Vercel domain'ine izin ver
+// Railway env: ALLOWED_ORIGIN = https://senin-proje.vercel.app
+app.use(cors({
+  origin: process.env['ALLOWED_ORIGIN'] || '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type'],
+}))
+
 app.use(express.json({ limit: '1mb' }))
 
 app.get('/health', (_, res) => res.json({ status: 'ok', decisions: decisionStore.length, uptime: process.uptime() }))
 app.get('/api/decisions', (_, res) => res.json(decisionStore))
 
-// ─── Şifre Doğrulama ─────────────────────────────────────────────────────────
+// Sifre Dogrulama
+// Railway env: CHAT_PASSWORD = senin_sifren
 app.post('/api/auth/verify-password', async (req, res) => {
   const { password } = req.body
-  console.log('🔑 istek geldi:', req.body)
+  console.log('Auth attempt:', new Date().toISOString())
   if (!password) return res.status(400).json({ error: 'password required' })
 
   const correctPassword = process.env['CHAT_PASSWORD'] ?? 'sql1967'
@@ -122,15 +130,14 @@ app.post('/api/auth/verify-password', async (req, res) => {
   }
   return res.status(401).json({ error: 'wrong password' })
 })
-// ──────────────────────────────────────────────────────────────────────────────
 
 app.get('/api/policies', (_, res) => res.json([
   { id: 'POL-001', label: 'POL-001 · HL-1 · Immutable State',  meta: 'HL-1 · Immutable State Guard · HARD_LOCK',  type: 'HARD_LOCK',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    let immutable = vec!["system.config","audit.log","policy.kernel"];\n    if decision.action == ActionType::ModifyState {\n        for resource in &immutable {\n            if decision.target.contains(resource) {\n                return PolicyResult { verdict: Verdict::Deny, reason: format!("HL-1: Immutable \'{}\' blocked", resource), policy_id: "POL-001", token: None };\n            }\n        }\n    }\n    PolicyResult::pass()\n}' },
   { id: 'POL-002', label: 'POL-002 · HL-2 · Non-Negative',      meta: 'HL-2 · Non-Negative Value Guard',           type: 'HARD_LOCK',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    if let Some(amount) = decision.payload.get("amount") {\n        if amount.as_f64().unwrap_or(0.0) < 0.0 {\n            return PolicyResult::deny("HL-2: Negative amount rejected");\n        }\n    }\n    PolicyResult::pass()\n}' },
-  { id: 'POL-003', label: 'POL-003 · HL-3 · Critical→Human',    meta: 'HL-3 · Critical Escalation · HARD_LOCK',    type: 'HARD_LOCK',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    if decision.criticality == Criticality::Critical {\n        return PolicyResult::ask_human("HL-3: Critical risk requires review");\n    }\n    PolicyResult::pass()\n}' },
+  { id: 'POL-003', label: 'POL-003 · HL-3 · Critical->Human',   meta: 'HL-3 · Critical Escalation · HARD_LOCK',    type: 'HARD_LOCK',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    if decision.criticality == Criticality::Critical {\n        return PolicyResult::ask_human("HL-3: Critical risk requires review");\n    }\n    PolicyResult::pass()\n}' },
   { id: 'POL-004', label: 'POL-004 · HL-4 · Ownership',          meta: 'HL-4 · Resource Ownership Guard',           type: 'ENFORCING',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    PolicyResult::pass()\n}' },
   { id: 'POL-007', label: 'POL-007 · Execution Token',            meta: 'Execution Token Validation · ENFORCING',   type: 'ENFORCING',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    PolicyResult::permit_with_token(ctx.issue_token(decision))\n}' },
-  { id: 'POL-011', label: 'POL-011 · Human Escalation',           meta: 'Low Confidence → ASK_HUMAN',               type: 'SOFT_STEER', code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    if decision.confidence < 0.7 {\n        return PolicyResult::ask_human("Low confidence — operator review");\n    }\n    PolicyResult::pass()\n}' },
+  { id: 'POL-011', label: 'POL-011 · Human Escalation',           meta: 'Low Confidence -> ASK_HUMAN',               type: 'SOFT_STEER', code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    if decision.confidence < 0.7 {\n        return PolicyResult::ask_human("Low confidence - operator review");\n    }\n    PolicyResult::pass()\n}' },
 ]))
 
 app.get('/api/session', (_, res) => {
@@ -155,8 +162,8 @@ app.get('/api/session', (_, res) => {
       { faz: 'FAZ 7', title: 'NotebookLM MCP',        done: false, active: false },
     ],
     issues: [
-      { id: 'ISSUE-001', level: 'warning', desc: 'execution_token JWT secret yönetimi belirsiz' },
-      { id: 'ISSUE-006', level: 'warning', desc: 'CLI testleri test.skip — ESM mock kısıtlaması' },
+      { id: 'ISSUE-001', level: 'warning', desc: 'execution_token JWT secret yonetimi belirsiz' },
+      { id: 'ISSUE-006', level: 'warning', desc: 'CLI testleri test.skip - ESM mock kisitlamasi' },
     ],
     mcp: { configured: !!MCP_URL, url: MCP_URL || null },
   })
@@ -165,7 +172,7 @@ app.get('/api/session', (_, res) => {
 app.post('/api/apply', (req, res) => {
   const patch = req.body as PatchInput
   if (!patch || typeof patch !== 'object')
-    return res.status(400).json({ error: 'Invalid patch body — must be JSON object' })
+    return res.status(400).json({ error: 'Invalid patch body - must be JSON object' })
 
   const start = Date.now()
   const { verdict, policy, reason, token } = evaluatePatch(patch)
@@ -182,7 +189,7 @@ app.post('/api/apply', (req, res) => {
   res.json(decision)
 })
 
-// ─── MCP Endpoint'leri ────────────────────────────────────────────────────────
+// MCP Endpointleri
 app.get('/mcp/status', async (_, res) => {
   const result = await mcpProxy('/status')
   res.json(result)
@@ -201,7 +208,6 @@ app.post('/mcp/query', async (req, res) => {
   const result = await mcpProxy('/query', body)
   res.json(result)
 })
-// ──────────────────────────────────────────────────────────────────────────────
 
 const server = http.createServer(app)
 const wss = new WebSocketServer({ server })
@@ -218,6 +224,6 @@ wss.on('connection', (ws) => {
 
 const PORT = parseInt(process.env['PORT'] ?? '8080', 10)
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ Sovereign Engine server :${PORT}`)
-  console.log(`🔗 MCP_URL: ${MCP_URL || '⚠️  not configured'}`)
+  console.log(`Sovereign Engine server :${PORT}`)
+  console.log(`MCP_URL: ${MCP_URL || 'not configured'}`)
 })
