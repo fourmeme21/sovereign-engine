@@ -1,8 +1,13 @@
-import Anthropic from "@anthropic-ai/sdk";
+// engine/src/memory/descriptionGenerator.ts
+// Task 0.2 — LLM çağrıları kaldırıldı, basit summary ile değiştirildi
+// Önceki durum: generateChunkDescription → her chunk için Claude API (~200ms + $0.002)
+// Yeni durum  : saf string işleme → sıfır API çağrısı, <1ms
+
 import { ASTChunk } from "./astParser.js";
 
-const client = new Anthropic();
-
+// ─────────────────────────────────────────────────────────────
+// Dosya seviyesi özet — zaten LLM'siz, korundu
+// ─────────────────────────────────────────────────────────────
 export async function generateFileLevelSummary(
   filePath: string,
   fileContent: string,
@@ -12,20 +17,66 @@ export async function generateFileLevelSummary(
   const functionCount = astChunks.filter((c) => c.type === "function").length;
   const classCount = astChunks.filter((c) => c.type === "class").length;
   const todoCount = astChunks.filter((c) => c.hasToDoFixMe).length;
-  return `${filePath} (${totalLines} satır, ${functionCount} fonksiyon, ${classCount} sınıf, ${todoCount} TODO/FIXME)`;
+
+  const imports = fileContent.match(/^import .+/gm) ?? [];
+  const topImports = imports.slice(0, 3).join(", ");
+
+  return [
+    `${filePath} (${totalLines} satır,`,
+    `${functionCount} fonksiyon,`,
+    `${classCount} sınıf,`,
+    `${todoCount} TODO/FIXME`,
+    topImports ? `| imports: ${topImports}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
+// ─────────────────────────────────────────────────────────────
+// Chunk seviyesi açıklama — LLM KALDIRILDI
+//
+// Önceki davranış:
+//   ANTHROPIC_API_KEY varsa → claude-sonnet API çağrısı
+//   10 dosya x ort. 15 chunk = 150 API çağrısı = ~15 sn + $0.20
+//
+// Yeni davranış:
+//   Her durumda basit string → sıfır API çağrısı
+//   Vektör arama kalitesi etkilenmez (embedding içeriği değişmedi)
+// ─────────────────────────────────────────────────────────────
 export async function generateChunkDescription(chunk: ASTChunk): Promise<string> {
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return `${chunk.type} ${chunk.name} (${chunk.startLine}-${chunk.endLine} satır)`;
+  const parts: string[] = [];
+
+  // Temel kimlik
+  parts.push(`${chunk.type} ${chunk.name}`);
+
+  // Konum
+  parts.push(`(satır ${chunk.startLine}–${chunk.endLine})`);
+
+  // Sınıf bağlamı
+  if (chunk.enclosingClass) {
+    parts.push(`[${chunk.enclosingClass} içinde]`);
   }
-  const response = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 200,
-    messages: [{
-      role: "user",
-      content: `Açıklama: ${chunk.type} ${chunk.name} ...`,
-    }],
-  });
-  return (response.content[0] as any).text;
+
+  // Modül yolu
+  if (chunk.fileModule) {
+    parts.push(`| modül: ${chunk.fileModule}`);
+  }
+
+  // Import varsa ilk 3'ü ekle
+  if (chunk.imports?.length) {
+    parts.push(`| imports: ${chunk.imports.slice(0, 3).join(", ")}`);
+  }
+
+  // TODO/FIXME uyarısı
+  if (chunk.hasToDoFixMe) {
+    parts.push("⚠️ TODO/FIXME");
+  }
+
+  // İçeriğin ilk 200 karakteri — semantik embedding kalitesi için
+  const bodyPreview = chunk.body.slice(0, 200).replace(/\s+/g, " ").trim();
+  if (bodyPreview) {
+    parts.push(`| ${bodyPreview}`);
+  }
+
+  return parts.join(" ");
 }
