@@ -57,7 +57,6 @@ router.post("/upload", async (req, res) => {
           metadata: { file: file_name, policy_id: policyResult.policy_id },
         });
 
-        // M-2: AUTO_APPROVED ise hemen memory chunk yaz
         if (policyResult.verdict === "AUTO_APPROVED") {
           await writeDecisionEvent({
             projectId: project_id,
@@ -74,9 +73,11 @@ router.post("/upload", async (req, res) => {
       }
     }
 
+    // TASK 0.3 PATCH 1: chunks_saved eklendi (UI bu key'i bekliyor)
     res.json({
       success: true,
       file: file_name,
+      chunks_saved: result.chunksCreated,
       chunks_created: result.chunksCreated,
       chunks_skipped: result.chunksSkipped,
       estimated_token_cost: result.tokenCost,
@@ -114,7 +115,18 @@ router.post("/query", async (req, res) => {
     if (data?.length) {
       await supabase.rpc("increment_reference_counts", { chunk_ids: data.map((r: any) => r.id) });
     }
-    res.json({ results: (data || []).map((row: any) => ({ id: row.id, content: row.content, source_file: row.source_path, memory_type: row.memory_type, similarity: row.similarity, metadata: row.metadata })) });
+    // TASK 0.3 PATCH 2: score eklendi (similarity korundu — geriye dönük uyumluluk)
+    res.json({
+      results: (data || []).map((row: any) => ({
+        id:          row.id,
+        content:     row.content,
+        source_file: row.source_path,
+        memory_type: row.memory_type,
+        score:       row.similarity,
+        similarity:  row.similarity,
+        metadata:    row.metadata,
+      })),
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -173,7 +185,6 @@ router.post("/session/close", async (req, res) => {
   });
 });
 
-// M-2: Manuel APPROVE / REJECT kaydı
 router.post("/decision", async (req, res) => {
   const { projectId, filePath, riskScore, traceId, action, reason, policyId, phase, taskCard } = req.body;
 
@@ -248,7 +259,6 @@ async function generateContinuityBriefing(projectId: string, lastSessionAt: Date
     .order("generated_at", { ascending: false })
     .limit(5);
 
-  // M-4: Son 10 karar event'i session başında inject et
   const { data: recentDecisionEvents } = await supabase
     .from("memory_chunks")
     .select("content, metadata, created_at")
@@ -285,7 +295,6 @@ async function generateContinuityBriefing(projectId: string, lastSessionAt: Date
       summary: d.semantic_summary || buildQuickSummary(d),
       when: d.generated_at,
     })),
-    // M-4: Son karar event'leri briefing'e eklendi
     recent_decisions: (recentDecisionEvents || []).map((e: any) => ({
       action: e.metadata?.action,
       file: e.metadata?.file_path,
