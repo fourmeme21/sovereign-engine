@@ -6,7 +6,11 @@ import { v4 as uuid } from 'uuid'
 import { execSync } from 'child_process'
 import fs from 'fs'
 import path from 'path'
-import { supabase } from './lib/supabase'
+import { supabase } from './lib/supabase.js'
+import { authMiddleware } from './middleware/authMiddleware.js'
+import { tierGuard } from './middleware/tierGuard.js'
+import memoryRouter from './routes/memoryRouter.js'
+import githubRouter from './routes/githubRouter.js'
 
 export type Verdict = 'PERMIT' | 'DENY' | 'ASK_HUMAN'
 export type Criticality = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
@@ -102,7 +106,7 @@ async function mcpProxy(subpath: string, body?: unknown) {
 
 const app = express()
 
-// CORS — production URL sabit, preview deploy'lar *.vercel.app pattern'i alir
+// CORS — Authorization header eklendi (Phase B)
 app.use(cors({
   origin: (origin, callback) => {
     const allowed = process.env['ALLOWED_ORIGIN'] || ''
@@ -113,15 +117,18 @@ app.use(cors({
     }
   },
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }))
 
 app.use(express.json({ limit: '1mb' }))
 
-app.get('/health', (_, res) => res.json({ status: 'ok', decisions: decisionStore.length, uptime: process.uptime() }))
-app.get('/api/decisions', (_, res) => res.json(decisionStore))
+// ─── Açık route'lar (auth gerektirmez) ───────────────────────
+app.get('/health', (_, res) => res.json({
+  status: 'ok',
+  decisions: decisionStore.length,
+  uptime: process.uptime(),
+}))
 
-// Sifre Dogrulama — Railway env: CHAT_PASSWORD
 app.post('/api/auth/verify-password', async (req, res) => {
   const { password } = req.body
   console.log('Auth attempt:', new Date().toISOString())
@@ -136,7 +143,12 @@ app.post('/api/auth/verify-password', async (req, res) => {
   return res.status(401).json({ error: 'wrong password' })
 })
 
-app.get('/api/policies', (_, res) => res.json([
+// ─── Korumalı route'lar (Phase B) ────────────────────────────
+app.get('/api/decisions', authMiddleware, tierGuard(), (_, res) => {
+  res.json(decisionStore)
+})
+
+app.get('/api/policies', authMiddleware, (_, res) => res.json([
   { id: 'POL-001', label: 'POL-001 · HL-1 · Immutable State',  meta: 'HL-1 · Immutable State Guard · HARD_LOCK',  type: 'HARD_LOCK',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    let immutable = vec!["system.config","audit.log","policy.kernel"];\n    if decision.action == ActionType::ModifyState {\n        for resource in &immutable {\n            if decision.target.contains(resource) {\n                return PolicyResult { verdict: Verdict::Deny, reason: format!("HL-1: Immutable \'{}\' blocked", resource), policy_id: "POL-001", token: None };\n            }\n        }\n    }\n    PolicyResult::pass()\n}' },
   { id: 'POL-002', label: 'POL-002 · HL-2 · Non-Negative',     meta: 'HL-2 · Non-Negative Value Guard',           type: 'HARD_LOCK',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    if let Some(amount) = decision.payload.get("amount") {\n        if amount.as_f64().unwrap_or(0.0) < 0.0 {\n            return PolicyResult::deny("HL-2: Negative amount rejected");\n        }\n    }\n    PolicyResult::pass()\n}' },
   { id: 'POL-003', label: 'POL-003 · HL-3 · Critical->Human',  meta: 'HL-3 · Critical Escalation · HARD_LOCK',    type: 'HARD_LOCK',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    if decision.criticality == Criticality::Critical {\n        return PolicyResult::ask_human("HL-3: Critical risk requires review");\n    }\n    PolicyResult::pass()\n}' },
@@ -145,7 +157,7 @@ app.get('/api/policies', (_, res) => res.json([
   { id: 'POL-011', label: 'POL-011 · Human Escalation',         meta: 'Low Confidence -> ASK_HUMAN',              type: 'SOFT_STEER', code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    if decision.confidence < 0.7 {\n        return PolicyResult::ask_human("Low confidence - operator review");\n    }\n    PolicyResult::pass()\n}' },
 ]))
 
-app.get('/api/session', (_, res) => {
+app.get('/api/session', authMiddleware, (_, res) => {
   const permits = decisionStore.filter(d => d.verdict === 'PERMIT').length
   const denies  = decisionStore.filter(d => d.verdict === 'DENY').length
   const human   = decisionStore.filter(d => d.verdict === 'ASK_HUMAN').length
@@ -174,7 +186,7 @@ app.get('/api/session', (_, res) => {
   })
 })
 
-app.post('/api/apply', (req, res) => {
+app.post('/api/apply', authMiddleware, tierGuard(), (req, res) => {
   const patch = req.body as PatchInput
   if (!patch || typeof patch !== 'object')
     return res.status(400).json({ error: 'Invalid patch body - must be JSON object' })
@@ -194,19 +206,19 @@ app.post('/api/apply', (req, res) => {
   res.json(decision)
 })
 
-// MCP Endpointleri
-app.get('/mcp/status', async (_, res) => {
+// ─── MCP (korumalı) ──────────────────────────────────────────
+app.get('/mcp/status', authMiddleware, async (_, res) => {
   const result = await mcpProxy('/status')
   res.json(result)
 })
 
-app.post('/mcp/sync', async (req, res) => {
+app.post('/mcp/sync', authMiddleware, async (req, res) => {
   const body = req.body as { files?: string[] }
   const result = await mcpProxy('/sync', body)
   res.json(result)
 })
 
-app.post('/mcp/query', async (req, res) => {
+app.post('/mcp/query', authMiddleware, async (req, res) => {
   const body = req.body as { question?: string }
   if (!body?.question)
     return res.status(400).json({ error: 'question field required' })
@@ -214,6 +226,11 @@ app.post('/mcp/query', async (req, res) => {
   res.json(result)
 })
 
+// ─── Router'lar (korumalı) ────────────────────────────────────
+app.use('/memory', authMiddleware, tierGuard(), memoryRouter)
+app.use('/github', authMiddleware, githubRouter)
+
+// ─── WebSocket ───────────────────────────────────────────────
 const server = http.createServer(app)
 const wss = new WebSocketServer({ server })
 
@@ -221,7 +238,10 @@ wss.on('connection', (ws) => {
   clients.add(ws)
   ws.send(JSON.stringify({ type: 'init', decisions: decisionStore } satisfies WsMessage))
   ws.on('message', (raw) => {
-    try { const msg = JSON.parse(raw.toString()); if (msg.type === 'ping') ws.send(JSON.stringify({ type: 'ping' })) } catch (_) {}
+    try {
+      const msg = JSON.parse(raw.toString())
+      if (msg.type === 'ping') ws.send(JSON.stringify({ type: 'ping' }))
+    } catch (_) {}
   })
   ws.on('close', () => clients.delete(ws))
   ws.on('error', (err) => console.error('[WS] Error:', err.message))
