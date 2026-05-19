@@ -7,10 +7,10 @@
     "node": ">=22.0.0"
   },
   "scripts": {
-  "type-check": "tsc --noEmit",
-  "build": "npm run type-check && tsc",
-  "start": "node dist/server/index.js",
-  "dev": "node --loader ts-node/esm src/server/index.ts"
+    "type-check": "tsc --noEmit",
+    "build": "npm run type-check && tsc",
+    "start": "node dist/server/index.js",
+    "dev": "node --loader ts-node/esm src/server/index.ts"
   },
   "dependencies": {
     "express": "^4.19.2",
@@ -22,7 +22,9 @@
     "tree-sitter": "^0.21.1",
     "tree-sitter-typescript": "^0.21.0",
     "tree-sitter-javascript": "^0.21.0",
-    "@anthropic-ai/sdk": "^0.24.0"
+    "@anthropic-ai/sdk": "^0.24.0",
+    "dodopayments": "^1.0.0",
+    "standardwebhooks": "^1.0.0"
   },
   "devDependencies": {
     "typescript": "^5.4.0",
