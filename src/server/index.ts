@@ -11,6 +11,7 @@ import { createClient } from '@supabase/supabase-js'
 import memoryRouter from '../../engine/src/routes/memoryRouter.js'
 import { processFileUpload } from '../../engine/src/memory/chunkPipeline.js'
 import githubRouter from '../routes/github.js'
+import dodoRouter from '../routes/dodoRouter.js'
 
 const supabase = createClient(
   process.env['SUPABASE_URL']!,
@@ -113,6 +114,7 @@ async function mcpProxy(subpath: string, body?: unknown) {
 const app = express()
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT'] }))
 
+// ─── RAW BODY ROUTES (express.json()'dan önce) ───────────────
 app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
   const signature = (req.headers['x-hub-signature-256'] as string) ?? ''
   const secret    = process.env['GITHUB_WEBHOOK_SECRET'] ?? ''
@@ -216,6 +218,13 @@ app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
   }
 })
 
+// Dodo webhook — raw body, express.json()'dan önce
+app.post('/api/dodo/webhook', express.raw({ type: 'application/json' }), (req, _res, next) => {
+  (req as any).rawBody = Buffer.isBuffer(req.body) ? req.body.toString() : String(req.body)
+  next()
+})
+
+// ─── JSON MIDDLEWARE ──────────────────────────────────────────
 app.use(express.json({ limit: '1mb' }))
 
 app.get('/health', (_, res) => res.json({ status: 'ok', decisions: decisionStore.length, uptime: process.uptime() }))
@@ -300,6 +309,7 @@ app.post('/mcp/query', async (req, res) => {
 
 app.use('/memory', memoryRouter)
 app.use('/github', githubRouter)
+app.use('/api/dodo', dodoRouter)
 
 const server = http.createServer(app)
 const wss = new WebSocketServer({ server })
