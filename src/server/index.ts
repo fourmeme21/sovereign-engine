@@ -310,6 +310,7 @@ app.post('/mcp/query', async (req, res) => {
 app.use('/memory', memoryRouter)
 app.use('/github', githubRouter)
 app.use('/api/dodo', dodoRouter)
+app.use('/api/billing', dodoRouter)   // UI alias
 
 const server = http.createServer(app)
 const wss = new WebSocketServer({ server })
