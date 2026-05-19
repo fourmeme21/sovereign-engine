@@ -21,13 +21,25 @@ const PRODUCT_TIER_MAP: Record<string, string> = {
   [process.env['DODO_PRODUCT_TEAM']!]: 'team',
 }
 
+const TIER_PRODUCT_MAP: Record<string, string> = {
+  solo: process.env['DODO_PRODUCT_SOLO']!,
+  pro:  process.env['DODO_PRODUCT_PRO']!,
+  team: process.env['DODO_PRODUCT_TEAM']!,
+}
+
 // ─── CHECKOUT ────────────────────────────────────────────────
 router.post('/checkout', async (req: Request, res: Response) => {
   try {
-    const { productId, userEmail } = req.body
+    const { tier, userEmail, productId: rawProductId } = req.body
+
+    const productId = rawProductId ?? TIER_PRODUCT_MAP[tier]
 
     if (!productId || !PRODUCT_TIER_MAP[productId]) {
-      return res.status(400).json({ error: 'Geçersiz productId' })
+      return res.status(400).json({
+        error: 'Geçersiz tier veya productId',
+        received: { tier, productId: rawProductId },
+        valid_tiers: ['solo', 'pro', 'team'],
+      })
     }
     if (!userEmail) {
       return res.status(400).json({ error: 'userEmail zorunlu' })
@@ -36,13 +48,13 @@ router.post('/checkout', async (req: Request, res: Response) => {
     const session = await dodo.checkoutSessions.create({
       product_cart: [{ product_id: productId, quantity: 1 }],
       customer: { email: userEmail, name: userEmail },
-      return_url: `${process.env['APP_URL'] ?? 'https://sovereign-engine.app'}/payment-success`,
+      return_url: `${process.env['APP_URL']}/junior/odeme-basarili`,
     })
 
     return res.json({ checkoutUrl: (session as any).checkout_url })
   } catch (err: any) {
-    console.error('[dodoRouter] checkout error:', err)
-    return res.status(500).json({ error: 'Checkout oluşturulamadı' })
+    console.error('[dodoRouter] checkout error:', err?.message ?? err)
+    return res.status(500).json({ error: 'Checkout oluşturulamadı', detail: err?.message })
   }
 })
 
@@ -71,7 +83,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
         const productId  = data.product_id ?? data.items?.[0]?.product_id
         const tier       = PRODUCT_TIER_MAP[productId] ?? 'solo'
         await supabase
-          .from('user_profiles')                                              // ✅ düzeltildi
+          .from('user_profiles')
           .update({ tier, dodo_customer_id: customerId, subscription_status: 'active' })
           .eq('email', data.customer?.email ?? '')
         break
@@ -79,7 +91,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
       case 'subscription.renewed': {
         const customerId = data.customer?.customer_id ?? data.customer_id
         await supabase
-          .from('user_profiles')                                              // ✅ düzeltildi
+          .from('user_profiles')
           .update({ subscription_status: 'active' })
           .eq('dodo_customer_id', customerId)
         break
@@ -88,7 +100,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
       case 'subscription.expired': {
         const customerId = data.customer?.customer_id ?? data.customer_id
         await supabase
-          .from('user_profiles')                                              // ✅ düzeltildi
+          .from('user_profiles')
           .update({ tier: 'free', subscription_status: 'cancelled' })
           .eq('dodo_customer_id', customerId)
         break
@@ -96,7 +108,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
       case 'subscription.on_hold': {
         const customerId = data.customer?.customer_id ?? data.customer_id
         await supabase
-          .from('user_profiles')                                              // ✅ düzeltildi
+          .from('user_profiles')
           .update({ subscription_status: 'on_hold' })
           .eq('dodo_customer_id', customerId)
         break
@@ -122,7 +134,7 @@ router.get('/portal', async (req: Request, res: Response) => {
     }
 
     const { data: dbUser } = await supabase
-      .from('user_profiles')                                                  // ✅ düzeltildi
+      .from('user_profiles')
       .select('dodo_customer_id')
       .eq('email', email)
       .single()
