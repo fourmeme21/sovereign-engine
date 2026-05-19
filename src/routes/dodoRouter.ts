@@ -71,7 +71,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
         const productId  = data.product_id ?? data.items?.[0]?.product_id
         const tier       = PRODUCT_TIER_MAP[productId] ?? 'solo'
         await supabase
-          .from('users')
+          .from('user_profiles')                                              // ✅ düzeltildi
           .update({ tier, dodo_customer_id: customerId, subscription_status: 'active' })
           .eq('email', data.customer?.email ?? '')
         break
@@ -79,7 +79,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
       case 'subscription.renewed': {
         const customerId = data.customer?.customer_id ?? data.customer_id
         await supabase
-          .from('users')
+          .from('user_profiles')                                              // ✅ düzeltildi
           .update({ subscription_status: 'active' })
           .eq('dodo_customer_id', customerId)
         break
@@ -88,7 +88,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
       case 'subscription.expired': {
         const customerId = data.customer?.customer_id ?? data.customer_id
         await supabase
-          .from('users')
+          .from('user_profiles')                                              // ✅ düzeltildi
           .update({ tier: 'free', subscription_status: 'cancelled' })
           .eq('dodo_customer_id', customerId)
         break
@@ -96,7 +96,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
       case 'subscription.on_hold': {
         const customerId = data.customer?.customer_id ?? data.customer_id
         await supabase
-          .from('users')
+          .from('user_profiles')                                              // ✅ düzeltildi
           .update({ subscription_status: 'on_hold' })
           .eq('dodo_customer_id', customerId)
         break
@@ -122,7 +122,7 @@ router.get('/portal', async (req: Request, res: Response) => {
     }
 
     const { data: dbUser } = await supabase
-      .from('users')
+      .from('user_profiles')                                                  // ✅ düzeltildi
       .select('dodo_customer_id')
       .eq('email', email)
       .single()
