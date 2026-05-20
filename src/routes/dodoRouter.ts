@@ -54,7 +54,7 @@ router.post('/checkout', async (req: Request, res: Response) => {
     return res.json({ checkoutUrl: (session as any).checkout_url })
   } catch (err: any) {
     console.error('[dodoRouter] checkout error:', err?.message ?? err)
-    return res.status(500).json({ error: 'Checkout oluşturulamadı', detail: err?.message })
+    return res.status(500).json({ error: 'Checkout oluşturulamadı' })
   }
 })
 
