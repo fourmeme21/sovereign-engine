@@ -73,7 +73,6 @@ router.post("/upload", async (req, res) => {
       }
     }
 
-    // TASK 0.3 PATCH 1: chunks_saved eklendi (UI bu key'i bekliyor)
     res.json({
       success: true,
       file: file_name,
@@ -89,12 +88,13 @@ router.post("/upload", async (req, res) => {
     });
 
   } catch (err: any) {
+    console.error('[memoryRouter] upload error:', err?.message)
     await writeAudit(trace, {
       stage: "REQUEST_RECEIVED",
       decision: "DENY",
       reason: err.message,
     });
-    res.status(500).json({ error: err.message, trace_id: trace.trace_id });
+    res.status(500).json({ error: "Upload işlemi başarısız", trace_id: trace.trace_id });
   }
 });
 
@@ -115,7 +115,6 @@ router.post("/query", async (req, res) => {
     if (data?.length) {
       await supabase.rpc("increment_reference_counts", { chunk_ids: data.map((r: any) => r.id) });
     }
-    // TASK 0.3 PATCH 2: score eklendi (similarity korundu — geriye dönük uyumluluk)
     res.json({
       results: (data || []).map((row: any) => ({
         id:          row.id,
@@ -128,7 +127,8 @@ router.post("/query", async (req, res) => {
       })),
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    console.error('[memoryRouter] query error:', err?.message)
+    res.status(500).json({ error: "Sorgu işlemi başarısız" });
   }
 });
 
@@ -150,26 +150,31 @@ router.post("/session/open", async (req, res) => {
   const { project_id } = req.body;
   if (!project_id) return res.status(400).json({ error: "project_id zorunlu" });
 
-  const { data: lastSession } = await supabase
-    .from("dev_sessions")
-    .select("ended_at")
-    .eq("project_id", project_id)
-    .not("ended_at", "is", null)
-    .order("ended_at", { ascending: false })
-    .limit(1)
-    .single();
+  try {
+    const { data: lastSession } = await supabase
+      .from("dev_sessions")
+      .select("ended_at")
+      .eq("project_id", project_id)
+      .not("ended_at", "is", null)
+      .order("ended_at", { ascending: false })
+      .limit(1)
+      .single();
 
-  const lastSessionAt = lastSession?.ended_at ? new Date(lastSession.ended_at) : null;
+    const lastSessionAt = lastSession?.ended_at ? new Date(lastSession.ended_at) : null;
 
-  const { data: newSession } = await supabase
-    .from("dev_sessions")
-    .insert({ project_id, started_at: new Date().toISOString() })
-    .select("id")
-    .single();
+    const { data: newSession } = await supabase
+      .from("dev_sessions")
+      .insert({ project_id, started_at: new Date().toISOString() })
+      .select("id")
+      .single();
 
-  const briefing = await generateContinuityBriefing(project_id, lastSessionAt);
+    const briefing = await generateContinuityBriefing(project_id, lastSessionAt);
 
-  res.json({ session_id: newSession?.id, briefing });
+    res.json({ session_id: newSession?.id, briefing });
+  } catch (err: any) {
+    console.error('[memoryRouter] session/open error:', err?.message)
+    res.status(500).json({ error: "Session açılamadı" });
+  }
 });
 
 router.post("/session/close", async (req, res) => {
@@ -200,7 +205,8 @@ router.post("/decision", async (req, res) => {
     await writeDecisionEvent({ projectId, filePath, riskScore: riskScore ?? 0, traceId, action, reason, policyId, phase, taskCard });
     res.json({ success: true, action, filePath });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    console.error('[memoryRouter] decision error:', err?.message)
+    res.status(500).json({ error: "Karar kaydedilemedi" });
   }
 });
 
