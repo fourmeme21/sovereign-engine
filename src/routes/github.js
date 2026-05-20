@@ -44,13 +44,14 @@ router.post('/commit', async (req, res) => {
     const result = await commitRes.json()
     res.json({ success: true, sha: result.content.sha, url: result.content.html_url })
   } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : String(err) })
+    console.error('[github] commit error:', err)
+    res.status(500).json({ error: 'Commit işlemi başarısız' })
   }
 })
 
-// GET /github/file?token=...&repo=...&path=...
-router.get('/file', async (req, res) => {
-  const { token, repo, path } = req.query
+// POST /github/file (token body'de — güvenli)
+router.post('/file', async (req, res) => {
+  const { token, repo, path } = req.body
 
   if (!token || !repo || !path)
     return res.status(400).json({ error: 'token, repo, path zorunlu' })
@@ -69,7 +70,8 @@ router.get('/file', async (req, res) => {
     const content = Buffer.from(data.content, 'base64').toString('utf-8')
     res.json({ content, sha: data.sha, path: data.path })
   } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : String(err) })
+    console.error('[github] file error:', err)
+    res.status(500).json({ error: 'Dosya alınamadı' })
   }
 })
 
