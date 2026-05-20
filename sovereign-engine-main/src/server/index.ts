@@ -11,6 +11,7 @@ import { authMiddleware } from './middleware/authMiddleware.js'
 import { tierGuard } from './middleware/tierGuard.js'
 import memoryRouter from './routes/memoryRouter.js'
 import githubRouter from './routes/githubRouter.js'
+import adminRouter from './routes/adminRouter.js'
 
 export type Verdict = 'PERMIT' | 'DENY' | 'ASK_HUMAN'
 export type Criticality = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
@@ -106,7 +107,7 @@ async function mcpProxy(subpath: string, body?: unknown) {
 
 const app = express()
 
-// CORS — Authorization header eklendi (Phase B)
+// CORS
 app.use(cors({
   origin: (origin, callback) => {
     const allowed = process.env['ALLOWED_ORIGIN'] || ''
@@ -143,7 +144,7 @@ app.post('/api/auth/verify-password', async (req, res) => {
   return res.status(401).json({ error: 'wrong password' })
 })
 
-// ─── Korumalı route'lar (Phase B) ────────────────────────────
+// ─── Korumalı route'lar ───────────────────────────────────────
 app.get('/api/decisions', authMiddleware, tierGuard(), (_, res) => {
   res.json(decisionStore)
 })
@@ -226,9 +227,10 @@ app.post('/mcp/query', authMiddleware, async (req, res) => {
   res.json(result)
 })
 
-// ─── Router'lar (korumalı) ────────────────────────────────────
+// ─── Router'lar ───────────────────────────────────────────────
 app.use('/memory', authMiddleware, tierGuard(), memoryRouter)
 app.use('/github', authMiddleware, githubRouter)
+app.use('/admin', adminRouter)
 
 // ─── WebSocket ───────────────────────────────────────────────
 const server = http.createServer(app)
