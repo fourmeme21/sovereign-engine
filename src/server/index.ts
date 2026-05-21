@@ -12,13 +12,16 @@ import memoryRouter from '../../engine/src/routes/memoryRouter.js'
 import { processFileUpload } from '../../engine/src/memory/chunkPipeline.js'
 import githubRouter from '../routes/github.js'
 import dodoRouter from '../routes/dodoRouter.js'
+import { authMiddleware } from '../../engine/src/middleware/authMiddleware.js'
 
 const supabase = createClient(
   process.env['SUPABASE_URL']!,
   process.env['SUPABASE_SERVICE_KEY']!
 )
 
-const PROJECT_ID = process.env['PROJECT_ID'] || '39fab005-0000-0000-0000-000000000000'
+// PROJECT_ID — sadece GitHub webhook için (server config, user context yok)
+// Hardcoded UUID fallback kaldırıldı — env var tanımlı olmalı
+const WEBHOOK_PROJECT_ID = process.env['PROJECT_ID']
 
 export type Verdict = 'PERMIT' | 'DENY' | 'ASK_HUMAN'
 export type Criticality = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
@@ -138,12 +141,18 @@ app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
   res.status(200).json({ ok: true })
 
   if (event === 'push') {
+    // Webhook server-to-server — WEBHOOK_PROJECT_ID env var gerekli
+    if (!WEBHOOK_PROJECT_ID) {
+      console.warn('[webhook] PROJECT_ID env var tanımlı değil — commit_index yazılmıyor')
+      return
+    }
+
     const { commits, ref } = payload
     const branch = ref.replace('refs/heads/', '')
 
     for (const commit of commits) {
       const { error: upsertError } = await supabase.from('commit_index').upsert({
-        project_id: PROJECT_ID,
+        project_id: WEBHOOK_PROJECT_ID,
         commit_hash: commit.id,
         parent_hash: commit.parents?.[0]?.sha ?? null,
         message: commit.message,
@@ -173,7 +182,7 @@ app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
 
       for (const { file, type } of allFiles) {
         const { error: insertError } = await supabase.from('commit_file_changes').insert({
-          project_id: PROJECT_ID,
+          project_id: WEBHOOK_PROJECT_ID,
           commit_hash: commit.id,
           file_path: file,
           change_type: type,
@@ -201,7 +210,7 @@ app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
                 : ""
 
               await processFileUpload(
-                PROJECT_ID,
+                WEBHOOK_PROJECT_ID,
                 file,
                 afterContent,
                 commit.id,
@@ -268,11 +277,13 @@ app.get('/api/session', (_, res) => {
   })
 })
 
-app.post('/api/apply', (req, res) => {
+// ─── /api/apply — authMiddleware eklendi, Supabase'e user_id ile yazılıyor ───
+app.post('/api/apply', authMiddleware, async (req, res) => {
   const patch = req.body as PatchInput
   if (!patch || typeof patch !== 'object')
     return res.status(400).json({ error: 'Invalid patch body — must be JSON object' })
 
+  const userId = (req as any).user.id
   const start = Date.now()
   const { verdict, policy, reason, token } = evaluatePatch(patch)
   const decision: Decision = {
@@ -283,6 +294,20 @@ app.post('/api/apply', (req, res) => {
     time: new Date().toLocaleTimeString('tr-TR'),
     latency: `${Date.now() - start}ms`,
   }
+
+  // Supabase'e user_id ile yaz — multi-tenant
+  const riskScore = { CRITICAL: 100, HIGH: 75, MEDIUM: 50, LOW: 25 }[decision.criticality] ?? 50
+  supabase.from('decisions').insert({
+    user_id: userId,
+    decision_object: patch,
+    status: verdict,
+    risk_score: riskScore,
+    policy_verdict: verdict,
+    trace_id: decision.id,
+  }).then(({ error }) => {
+    if (error) console.error('[apply] supabase insert error:', error.message)
+  })
+
   addDecision(decision)
   broadcast({ type: 'decision', decision })
   res.json(decision)
@@ -310,7 +335,7 @@ app.post('/mcp/query', async (req, res) => {
 app.use('/memory', memoryRouter)
 app.use('/github', githubRouter)
 app.use('/api/dodo', dodoRouter)
-app.use('/api/billing', dodoRouter)   // UI alias
+app.use('/api/billing', dodoRouter)
 
 const server = http.createServer(app)
 const wss = new WebSocketServer({ server })
