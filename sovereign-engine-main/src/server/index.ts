@@ -89,7 +89,7 @@ function evaluatePatch(patch: PatchInput): { verdict: Verdict; policy: string; r
   return { verdict: 'PERMIT', policy: 'POL-007', reason: 'All checks passed - execution token issued', token }
 }
 
-// MCP Proxy
+// ─── MCP Proxy ───────────────────────────────────────────────
 const MCP_URL = process.env['MCP_URL'] ?? ''
 
 async function mcpProxy(subpath: string, body?: unknown) {
@@ -112,15 +112,14 @@ const app = express()
 
 // ─── CORS ────────────────────────────────────────────────────
 const ALLOWED_ORIGINS = [
-  process.env['APP_URL'],                    // production URL
-  process.env['ALLOWED_ORIGIN'],             // ek origin (opsiyonel)
-  'http://localhost:5173',                   // local dev
-  'http://localhost:4173',                   // local preview
+  process.env['APP_URL'],
+  process.env['ALLOWED_ORIGIN'],
+  'http://localhost:5173',
+  'http://localhost:4173',
 ].filter(Boolean) as string[]
 
 app.use(cors({
   origin: (origin, callback) => {
-    // same-origin veya server-to-server
     if (!origin) return callback(null, true)
     if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true)
     callback(new Error(`CORS: izin verilmeyen origin — ${origin}`))
@@ -130,7 +129,6 @@ app.use(cors({
 }))
 
 // ─── Webhook raw body (express.json'dan ÖNCE) ────────────────
-// Dodo imza doğrulaması için raw body şart
 app.use('/api/billing/webhook', express.raw({ type: 'application/json' }), (req, _res, next) => {
   ;(req as any).rawBody = (req.body as Buffer).toString('utf8')
   next()
@@ -141,8 +139,8 @@ app.use(express.json({ limit: '1mb' }))
 
 // ─── Rate limiting ───────────────────────────────────────────
 const globalLimiter = rateLimit({
-  windowMs: 60 * 1000,   // 1 dakika
-  max: 120,              // IP başına 120 istek/dk
+  windowMs: 60 * 1000,
+  max: 120,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Çok fazla istek — lütfen bekle.' },
@@ -150,7 +148,7 @@ const globalLimiter = rateLimit({
 
 const aiLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 30,               // AI endpoint'i daha kısıtlı
+  max: 30,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'AI rate limit aşıldı.' },
@@ -159,7 +157,7 @@ const aiLimiter = rateLimit({
 app.use(globalLimiter)
 app.use('/api/ai', aiLimiter)
 
-// ─── Açık route'lar (auth gerektirmez) ───────────────────────
+// ─── Açık route'lar ──────────────────────────────────────────
 app.get('/health', (_, res) => res.json({
   status: 'ok',
   decisions: decisionStore.length,
@@ -206,7 +204,7 @@ app.get('/api/session', authMiddleware, (_, res) => {
   })
 })
 
-app.post('/api/apply', authMiddleware, tierGuard(), (req, res) => {
+app.post('/api/apply', authMiddleware, tierGuard(), async (req, res) => {
   const patch = req.body as PatchInput
   if (!patch || typeof patch !== 'object')
     return res.status(400).json({ error: 'Invalid patch body' })
@@ -224,6 +222,24 @@ app.post('/api/apply', authMiddleware, tierGuard(), (req, res) => {
   addDecision(decision)
   broadcast({ type: 'decision', decision })
   res.json(decision)
+
+  // +++ Supabase persist (Phase 0 — user_id bazlı) +++
+  const userId = (req as any).user?.id
+  if (userId) {
+    const riskScore = patch.criticality === 'CRITICAL' ? 9
+      : patch.criticality === 'HIGH'   ? 7
+      : patch.criticality === 'MEDIUM' ? 5 : 2
+    supabase.from('decisions').insert({
+      user_id:         userId,
+      decision_object: decision,
+      status:          verdict === 'PERMIT' ? 'approved' : verdict === 'DENY' ? 'rejected' : 'pending',
+      risk_score:      riskScore,
+      policy_verdict:  verdict,
+      trace_id:        decision.id,
+    }).then(({ error }) => {
+      if (error) console.error('[apply] Supabase insert error:', error.message)
+    })
+  }
 })
 
 // ─── MCP (korumalı) ──────────────────────────────────────────
@@ -248,8 +264,8 @@ app.post('/mcp/query', authMiddleware, async (req, res) => {
 app.use('/memory',      authMiddleware, tierGuard(), memoryRouter)
 app.use('/github',      authMiddleware, githubRouter)
 app.use('/admin',       adminRouter)
-app.use('/api/billing', dodoRouter)         // Phase D — Dodo Payments
-app.use('/api/ai',      authMiddleware, aiProxy)   // Phase B — AI Proxy
+app.use('/api/billing', dodoRouter)
+app.use('/api/ai',      authMiddleware, aiProxy)
 
 // ─── WebSocket ───────────────────────────────────────────────
 const server = http.createServer(app)
