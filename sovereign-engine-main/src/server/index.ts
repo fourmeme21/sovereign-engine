@@ -2,6 +2,7 @@ import express from 'express'
 import http from 'http'
 import { WebSocketServer, WebSocket } from 'ws'
 import cors from 'cors'
+import rateLimit from 'express-rate-limit'
 import { v4 as uuid } from 'uuid'
 import { execSync } from 'child_process'
 import fs from 'fs'
@@ -12,6 +13,8 @@ import { tierGuard } from './middleware/tierGuard.js'
 import memoryRouter from './routes/memoryRouter.js'
 import githubRouter from './routes/githubRouter.js'
 import adminRouter from './routes/adminRouter.js'
+import dodoRouter  from './routes/dodoRouter.js'
+import aiProxy     from './routes/aiProxy.js'
 
 export type Verdict = 'PERMIT' | 'DENY' | 'ASK_HUMAN'
 export type Criticality = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
@@ -107,21 +110,54 @@ async function mcpProxy(subpath: string, body?: unknown) {
 
 const app = express()
 
-// CORS
+// ─── CORS ────────────────────────────────────────────────────
+const ALLOWED_ORIGINS = [
+  process.env['APP_URL'],                    // production URL
+  process.env['ALLOWED_ORIGIN'],             // ek origin (opsiyonel)
+  'http://localhost:5173',                   // local dev
+  'http://localhost:4173',                   // local preview
+].filter(Boolean) as string[]
+
 app.use(cors({
   origin: (origin, callback) => {
-    const allowed = process.env['ALLOWED_ORIGIN'] || ''
-    if (!origin || origin === allowed || origin.endsWith('.vercel.app')) {
-      callback(null, true)
-    } else {
-      callback(new Error('CORS: izin verilmeyen origin'))
-    }
+    // same-origin veya server-to-server
+    if (!origin) return callback(null, true)
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true)
+    callback(new Error(`CORS: izin verilmeyen origin — ${origin}`))
   },
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-password'],
 }))
 
+// ─── Webhook raw body (express.json'dan ÖNCE) ────────────────
+// Dodo imza doğrulaması için raw body şart
+app.use('/api/billing/webhook', express.raw({ type: 'application/json' }), (req, _res, next) => {
+  ;(req as any).rawBody = (req.body as Buffer).toString('utf8')
+  next()
+})
+
+// ─── Body parser ─────────────────────────────────────────────
 app.use(express.json({ limit: '1mb' }))
+
+// ─── Rate limiting ───────────────────────────────────────────
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,   // 1 dakika
+  max: 120,              // IP başına 120 istek/dk
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Çok fazla istek — lütfen bekle.' },
+})
+
+const aiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,               // AI endpoint'i daha kısıtlı
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'AI rate limit aşıldı.' },
+})
+
+app.use(globalLimiter)
+app.use('/api/ai', aiLimiter)
 
 // ─── Açık route'lar (auth gerektirmez) ───────────────────────
 app.get('/health', (_, res) => res.json({
@@ -129,20 +165,6 @@ app.get('/health', (_, res) => res.json({
   decisions: decisionStore.length,
   uptime: process.uptime(),
 }))
-
-app.post('/api/auth/verify-password', async (req, res) => {
-  const { password } = req.body
-  console.log('Auth attempt:', new Date().toISOString())
-  if (!password) return res.status(400).json({ error: 'password required' })
-
-  const correctPassword = process.env['CHAT_PASSWORD'] ?? 'sql1967'
-
-  if (password === correctPassword) {
-    const token = `se_${Buffer.from(`${Date.now()}`).toString('base64')}`
-    return res.json({ ok: true, token })
-  }
-  return res.status(401).json({ error: 'wrong password' })
-})
 
 // ─── Korumalı route'lar ───────────────────────────────────────
 app.get('/api/decisions', authMiddleware, tierGuard(), (_, res) => {
@@ -179,10 +201,7 @@ app.get('/api/session', authMiddleware, (_, res) => {
       { faz: 'FAZ 6', title: 'Dashboard',             done: true,  active: true  },
       { faz: 'FAZ 7', title: 'NotebookLM MCP',        done: false, active: false },
     ],
-    issues: [
-      { id: 'ISSUE-001', level: 'warning', desc: 'execution_token JWT secret yonetimi belirsiz' },
-      { id: 'ISSUE-006', level: 'warning', desc: 'CLI testleri test.skip - ESM mock kisitlamasi' },
-    ],
+    issues: [],
     mcp: { configured: !!MCP_URL, url: MCP_URL || null },
   })
 })
@@ -190,7 +209,7 @@ app.get('/api/session', authMiddleware, (_, res) => {
 app.post('/api/apply', authMiddleware, tierGuard(), (req, res) => {
   const patch = req.body as PatchInput
   if (!patch || typeof patch !== 'object')
-    return res.status(400).json({ error: 'Invalid patch body - must be JSON object' })
+    return res.status(400).json({ error: 'Invalid patch body' })
 
   const start = Date.now()
   const { verdict, policy, reason, token } = evaluatePatch(patch)
@@ -214,23 +233,23 @@ app.get('/mcp/status', authMiddleware, async (_, res) => {
 })
 
 app.post('/mcp/sync', authMiddleware, async (req, res) => {
-  const body = req.body as { files?: string[] }
-  const result = await mcpProxy('/sync', body)
+  const result = await mcpProxy('/sync', req.body)
   res.json(result)
 })
 
 app.post('/mcp/query', authMiddleware, async (req, res) => {
-  const body = req.body as { question?: string }
-  if (!body?.question)
+  if (!req.body?.question)
     return res.status(400).json({ error: 'question field required' })
-  const result = await mcpProxy('/query', body)
+  const result = await mcpProxy('/query', req.body)
   res.json(result)
 })
 
 // ─── Router'lar ───────────────────────────────────────────────
-app.use('/memory', authMiddleware, tierGuard(), memoryRouter)
-app.use('/github', authMiddleware, githubRouter)
-app.use('/admin', adminRouter)
+app.use('/memory',      authMiddleware, tierGuard(), memoryRouter)
+app.use('/github',      authMiddleware, githubRouter)
+app.use('/admin',       adminRouter)
+app.use('/api/billing', dodoRouter)         // Phase D — Dodo Payments
+app.use('/api/ai',      authMiddleware, aiProxy)   // Phase B — AI Proxy
 
 // ─── WebSocket ───────────────────────────────────────────────
 const server = http.createServer(app)
@@ -251,6 +270,7 @@ wss.on('connection', (ws) => {
 
 const PORT = parseInt(process.env['PORT'] ?? '8080', 10)
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Sovereign Engine server :${PORT}`)
+  console.log(`Sovereign Engine :${PORT}`)
+  console.log(`Origins: ${ALLOWED_ORIGINS.join(', ')}`)
   console.log(`MCP_URL: ${MCP_URL || 'not configured'}`)
 })
