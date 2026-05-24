@@ -290,3 +290,15 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`Origins: ${ALLOWED_ORIGINS.join(', ')}`)
   console.log(`MCP_URL: ${MCP_URL || 'not configured'}`)
 })
+// ─── RAILWAY KEEP-ALIVE (Self-Ping) ──────────────────────────
+// Railway 30 dk boşlukta uyur. 10 dakikada bir kendini pingleyerek aktif tutuyoruz.
+setInterval(() => {
+  const url = `http://localhost:${PORT}/health`;
+  http.get(url, (res) => {
+    if (res.statusCode === 200) {
+      console.log('[Keep-Alive] Ping başarılı:', new Date().toLocaleTimeString());
+    }
+  }).on('error', (err) => {
+    console.error('[Keep-Alive] Ping hatası:', err.message);
+  });
+}, 10 * 60 * 1000); // 10 dakika
