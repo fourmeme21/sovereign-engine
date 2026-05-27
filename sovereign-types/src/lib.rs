@@ -34,11 +34,19 @@ pub struct Decision {
     pub context: DecisionContext,
     pub metadata: DecisionMetadata,
 
-    /// PENDING | VALIDATED | POLICY_APPROVED | EXECUTING | COMPLETED | REJECTED | BLOCKED
+    /// PENDING | VALIDATED | POLICY_APPROVED | PENDING_HUMAN | EXECUTING | COMPLETED | REJECTED | BLOCKED
+    /// PENDING_HUMAN: TypeScript orchestration katmanı yönetir.
+    /// retry_count bu tarafta dikkate alınmaz — Rust binary'e gönderilmez.
     pub status: String,
 
     /// Hash chain — SHA-256(önceki kayıt). İlk kayıtta None.
     pub audit_hash: Option<String>,
+
+    /// PENDING_HUMAN → token expire sayacı.
+    /// TypeScript orchestration katmanı yönetir — Policy Kernel bu alanı okumaz/yazmaz.
+    /// Varsayılan: 0 | Maksimum: 3 (TOKEN_RETRY_LIMIT → otomatik REJECTED)
+    /// ARCHITECTURE.md §2.1, §3.3, §3.4
+    pub retry_count: Option<u32>,
 }
 
 /// Decision.payload — iş aksiyonunu tanımlar.
