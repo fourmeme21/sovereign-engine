@@ -170,7 +170,7 @@ describe("Enum Değer Uyumluluğu — Rust serde eşleştirmesi", () => {
   const validIntents = ["READ_DATA", "WRITE_DATA", "EXECUTE_ACTION", "TRIGGER_EVENT", "MODIFY_STATE"];
   const validRisks   = ["LOW", "MEDIUM", "HIGH", "CRITICAL"];
   const validConf    = ["HIGH", "MEDIUM", "LOW"];
-  const validStatus  = ["PENDING", "VALIDATED", "POLICY_APPROVED", "EXECUTING", "COMPLETED", "REJECTED", "BLOCKED"];
+  const validStatus  = ["PENDING", "VALIDATED", "POLICY_APPROVED", "PENDING_HUMAN", "EXECUTING", "COMPLETED", "REJECTED", "BLOCKED"];
 
   test("tüm geçerli Intent değerleri roundtrip'te korunur", () => {
     validIntents.forEach(intent => {
@@ -349,5 +349,49 @@ describe("ts-rs Değerlendirme — Rust ↔ TypeScript tip eşleştirmesi", () =
     // schema_version: "1.0" — TypeScript literal → Rust: #[serde(rename="1.0")]
     const d = makeDecision();
     expect(d.schema_version).toBe("1.0");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PENDING_HUMAN + retry_count Roundtrip
+// ---------------------------------------------------------------------------
+
+describe("PENDING_HUMAN + retry_count — roundtrip bütünlüğü", () => {
+
+  test("PENDING_HUMAN status roundtrip'te korunur", () => {
+    const d      = makeDecision({ status: "PENDING_HUMAN" });
+    const result = roundtrip(d) as Decision;
+    expect(result.status).toBe("PENDING_HUMAN");
+  });
+
+  test("retry_count = 0 roundtrip'te korunur", () => {
+    const d      = makeDecision({ status: "PENDING_HUMAN", retry_count: 0 });
+    const result = roundtrip(d) as Decision;
+    expect(result.retry_count).toBe(0);
+    expect(result.status).toBe("PENDING_HUMAN");
+  });
+
+  test("retry_count = 2 roundtrip'te korunur", () => {
+    const d      = makeDecision({ status: "PENDING_HUMAN", retry_count: 2 });
+    const result = roundtrip(d) as Decision;
+    expect(result.retry_count).toBe(2);
+  });
+
+  test("retry_count = 3 + REJECTED — TOKEN_RETRY_LIMIT son durumu roundtrip'te korunur", () => {
+    const d      = makeDecision({ status: "REJECTED", retry_count: 3 });
+    const result = roundtrip(d) as Decision;
+    expect(result.status).toBe("REJECTED");
+    expect(result.retry_count).toBe(3);
+  });
+
+  test("retry_count undefined ise roundtrip sonrası undefined kalır", () => {
+    const d      = makeDecision();   // retry_count yok
+    const result = roundtrip(d) as Decision;
+    expect(result.retry_count).toBeUndefined();
+  });
+
+  test("isDecision — retry_count ile Decision geçerli olarak tanınır", () => {
+    const d = makeDecision({ status: "PENDING_HUMAN", retry_count: 1 });
+    expect(isDecision(roundtrip(d))).toBe(true);
   });
 });
