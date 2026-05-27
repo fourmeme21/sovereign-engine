@@ -204,8 +204,68 @@ export async function callPolicyKernel(
 }
 
 // ---------------------------------------------------------------------------
-// Sağlık Kontrolü
+// PENDING_HUMAN Orkestrasyon Yardımcıları
 // ---------------------------------------------------------------------------
+
+/** Token expire döngüsünde izin verilen maksimum deneme sayısı. */
+const MAX_RETRY_COUNT = 3;
+
+/**
+ * Policy Kernel'den ASK_HUMAN döndüğünde çağrılır.
+ * Decision.status → "PENDING_HUMAN", retry_count başlatılır (yoksa 0).
+ *
+ * ARCHITECTURE.md §3.3:
+ *   ASK_HUMAN çıktısında TypeScript orchestration:
+ *     → Decision.status = "PENDING_HUMAN"
+ *     → Decision.retry_count = (mevcut değer veya 0)
+ *     → execution_token üretilmez — insan onayı beklenir
+ *
+ * @param decision - VALIDATED durumundaki Decision
+ * @returns Güncellenmiş Decision (status: PENDING_HUMAN)
+ */
+export function applyAskHuman(decision: Decision): Decision {
+  return {
+    ...decision,
+    status:      "PENDING_HUMAN",
+    retry_count: decision.retry_count ?? 0,
+  };
+}
+
+/**
+ * Execution Gate EXPIRED_TOKEN döndürdüğünde çağrılır.
+ * retry_count++ — sınıra ulaşılırsa otomatik REJECTED.
+ *
+ * ARCHITECTURE.md §3.4:
+ *   EXPIRED_TOKEN alınca TypeScript orchestration:
+ *     → Decision.status değişmez ("PENDING_HUMAN" kalır)
+ *     → Decision.retry_count++
+ *     → retry_count >= 3 → status = "REJECTED", error_code: TOKEN_RETRY_LIMIT
+ *     → retry_count < 3  → insan yeniden onaylayabilir
+ *
+ * @param decision - PENDING_HUMAN durumundaki Decision
+ * @returns { decision: Decision, limitReached: boolean }
+ *          limitReached=true → status "REJECTED" olarak ayarlandı (TOKEN_RETRY_LIMIT)
+ */
+export function handleExpiredToken(decision: Decision): {
+  decision:     Decision;
+  limitReached: boolean;
+} {
+  const newCount = (decision.retry_count ?? 0) + 1;
+
+  if (newCount >= MAX_RETRY_COUNT) {
+    return {
+      decision:     { ...decision, status: "REJECTED", retry_count: newCount },
+      limitReached: true,
+    };
+  }
+
+  return {
+    decision:     { ...decision, status: "PENDING_HUMAN", retry_count: newCount },
+    limitReached: false,
+  };
+}
+
+
 
 /**
  * Policy Kernel binary'nin mevcut ve çalışır olduğunu doğrular.
