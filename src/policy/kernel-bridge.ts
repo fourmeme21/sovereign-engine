@@ -83,9 +83,10 @@ export async function callPolicyKernel(
     };
 
     // Binary'yi spawn et
+    // SAP-01 FIX: "policy" modu argümanı eklendi — main.rs match "policy" bekliyor
     let kernel: ReturnType<typeof spawn>;
     try {
-      kernel = spawn(KERNEL_BINARY, [], {
+      kernel = spawn(KERNEL_BINARY, ["policy"], {
         env: {
           ...process.env,
           JWT_SECRET:          process.env["JWT_SECRET"] ?? "",
@@ -209,11 +210,15 @@ export async function callPolicyKernel(
 /**
  * Policy Kernel binary'nin mevcut ve çalışır olduğunu doğrular.
  * Startup fail-closed: binary yoksa sistem başlamaz.
+ *
+ * SAP-02 FIX:
+ *   - "healthcheck" modu kullanılıyor — main.rs bu modu tanıyor
+ *   - resolve(code === 0) — ARCH §7: "exit 0 değilse sistem başlamaz"
  */
 export async function healthCheck(): Promise<boolean> {
   return new Promise((resolve) => {
-    const kernel = spawn(KERNEL_BINARY, ["--version"], {
-      stdio: ["ignore", "ignore", "ignore"],
+    const kernel = spawn(KERNEL_BINARY, ["healthcheck"], {
+      stdio: ["ignore", "pipe", "ignore"],
     });
 
     const timer = setTimeout(() => {
@@ -223,8 +228,8 @@ export async function healthCheck(): Promise<boolean> {
 
     kernel.on("close", (code: number | null) => {
       clearTimeout(timer);
-      // --version flag olmasa da binary var demek exit code ne olursa olsun
-      resolve(code !== null);
+      // ARCH §7: exit 0 = sağlıklı, diğer her kod = fail-closed
+      resolve(code === 0);
     });
 
     kernel.on("error", () => {
