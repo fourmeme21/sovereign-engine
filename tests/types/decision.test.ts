@@ -86,7 +86,7 @@ describe("isDecision()", () => {
 
 describe("isImmutableStatus()", () => {
   const immutable: DecisionStatus[] = ["COMPLETED", "REJECTED", "BLOCKED"];
-  const mutable: DecisionStatus[]   = ["PENDING", "VALIDATED", "POLICY_APPROVED", "EXECUTING"];
+  const mutable: DecisionStatus[]   = ["PENDING", "VALIDATED", "POLICY_APPROVED", "PENDING_HUMAN", "EXECUTING"];
 
   immutable.forEach((status) => {
     test(`${status} → true (kilitli)`, () => {
@@ -98,6 +98,41 @@ describe("isImmutableStatus()", () => {
     test(`${status} → false (değiştirilebilir)`, () => {
       expect(isImmutableStatus(status)).toBe(false);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// retry_count — ARCHITECTURE §2.1 + §3.3 + §3.4
+// ---------------------------------------------------------------------------
+
+describe("Decision.retry_count", () => {
+  test("retry_count belirtilmemişse Decision geçerlidir", () => {
+    const d = makeDecision();
+    expect(d.retry_count).toBeUndefined();
+    expect(isDecision(d)).toBe(true);
+  });
+
+  test("retry_count = 0 ile PENDING_HUMAN Decision geçerlidir", () => {
+    const d = makeDecision({ status: "PENDING_HUMAN", retry_count: 0 });
+    expect(isDecision(d)).toBe(true);
+    expect(d.retry_count).toBe(0);
+  });
+
+  test("retry_count = 2 (sınırın altı) — hâlâ PENDING_HUMAN", () => {
+    const d = makeDecision({ status: "PENDING_HUMAN", retry_count: 2 });
+    expect(d.status).toBe("PENDING_HUMAN");
+    expect(d.retry_count).toBe(2);
+  });
+
+  test("retry_count = 3 ile status REJECTED olmak zorundadır (TOKEN_RETRY_LIMIT)", () => {
+    // Orchestration katmanının üretmesi beklenen son durum
+    const d = makeDecision({ status: "REJECTED", retry_count: 3 });
+    expect(d.status).toBe("REJECTED");
+    expect(d.retry_count).toBe(3);
+  });
+
+  test("PENDING_HUMAN — isImmutableStatus false döner (geçiş yapılabilir)", () => {
+    expect(isImmutableStatus("PENDING_HUMAN")).toBe(false);
   });
 });
 
