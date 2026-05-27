@@ -5,7 +5,10 @@
  *   - TS katmanı: Rust binary'ye gereksiz IPC engellemek için erken kontrol
  *   - Rust katmanı: Nihai garanti (crash sonrası yeniden başlamada geçerli)
  *
- * TTL: 5 dakika (Rust tarafıyla senkron — ARCHITECTURE.md §5)
+ * SAP-05 Fix: TTL 300s → 30s (execution_token süresiyle senkron — ARCHITECTURE.md §5)
+ * SAP-06 Fix: buildIdempotencyKey'e window alanı eklendi — TTL penceresi dolunca
+ *             aynı karar yeni key üretir, replay koruması sağlanır
+ *
  * Max entry: 1_000 (solo operator ölçeği)
  * Depolama: in-process Map — dağıtık sistem için Redis gerekir (ARCHITECTURE.md §8)
  */
@@ -22,7 +25,13 @@ interface CacheEntry {
 
 // ─── STORE ───────────────────────────────────────────────────────────────────
 
-const TTL_MS = 5 * 60 * 1_000; // 5 dakika
+/**
+ * SAP-05: TTL 30 saniye — execution_token süresiyle senkron.
+ * CORE.md §9: "Token süresi (30s) dolarsa Execution Gate DENY döner"
+ * Önceki değer 300s (5 dakika) idi — ARCHITECTURE.md §5 ile çelişiyordu.
+ */
+const TTL_MS = 30 * 1_000; // 30 saniye
+
 const MAX_ENTRIES = 1_000;
 
 const store = new Map<string, CacheEntry>();
@@ -30,13 +39,19 @@ const store = new Map<string, CacheEntry>();
 // ─── PUBLIC API ──────────────────────────────────────────────────────────────
 
 /**
- * decision + policyHash'ten deterministik idempotency key üretir.
+ * SAP-06: decision + policyHash + window'dan deterministik idempotency key üretir.
  *
- * SHA-256(canonical({ id, schema_version, intent, category, payload, policyHash }))
+ * SHA-256(canonical({ id, schema_version, intent, category, payload, policyHash, window }))
+ *
+ * window alanı:
+ *   Math.floor(Date.now() / TTL_MS) — her 30 saniyede bir yeni pencere.
+ *   TTL dolunca aynı decision farklı key üretir → yeniden deneme mümkün.
+ *   Pencere içindeyken aynı key → idempotency koruması aktif.
  *
  * Rust tarafındaki decision.id tabanlı key ile uyumlu:
  *   - id farklıysa farklı key → doğru davranış
  *   - Aynı payload, farklı policy_hash → farklı key (replay koruması)
+ *   - Aynı her şey, farklı window → farklı key (TTL sonrası yeniden deneme)
  */
 export function buildIdempotencyKey(
   decision: {
@@ -48,6 +63,9 @@ export function buildIdempotencyKey(
   },
   policyHash: string,
 ): string {
+  // SAP-06: Zaman penceresi — her TTL_MS'de bir yeni slot
+  const windowSlot = Math.floor(Date.now() / TTL_MS);
+
   const canonical = toCanonicalJson({
     id: decision.id,
     schema_version: decision.schema_version,
@@ -55,6 +73,7 @@ export function buildIdempotencyKey(
     category: decision.category,
     payload: decision.payload,
     policyHash,
+    window: windowSlot, // SAP-06: eklendi — pencere bazlı replay koruması
   });
 
   return createHash('sha256').update(canonical).digest('hex');
