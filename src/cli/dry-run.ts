@@ -6,8 +6,14 @@
  *
  * Akış (ARCHITECTURE.md §4 — Adım 1-5):
  *   1-3. validate ile aynı (Patch + Decision + ValidationEngine)
- *   4.   Policy Kernel — Faz 3'e kadar simüle edilir (stub)
+ *   4.   Policy Kernel — evaluatePolicy() (SAP-07 Fix)
  *   5.   Diff üret — dosyaya DOKUNMA
+ *
+ * SAP-07 Fix: Policy Kernel stub kaldırıldı.
+ *   evaluatePolicy() çağrısı eklendi:
+ *     - TypeScript domain kuralları önce çalışır
+ *     - DENY/BLOCK → dry-run reddedilir, Rust'a gitmez
+ *     - PERMIT → Rust hard lock'ları devreye girer
  *
  * ⚠️ dry-run hiçbir dosyayı değiştirmez — sadece gösterir.
  *
@@ -26,6 +32,7 @@ import { isPatch, isConfidenceValid,
 import type { Patch, PatchOperation }   from "../types/patch.js";
 import { formatError }                  from "../validation/errors.js";
 import { patchToDecision, getCliActor } from "./patch-to-decision.js";
+import { evaluatePolicy }               from "../policy/domain-rules.js";
 
 // ---------------------------------------------------------------------------
 // ANSI renk sabitleri
@@ -55,7 +62,7 @@ export interface OperationDiff {
   search:   string;
   replace:  string;
   found:    boolean;
-  preview?: string;   // Değişiklik sonrası ilgili satır
+  preview?: string;
 }
 
 /**
@@ -83,7 +90,6 @@ async function generateDiff(patch: Patch): Promise<DiffResult> {
     let preview: string | undefined;
 
     if (searchFound) {
-      // Değişiklik sonrası görünümü simüle et (ilk 80 karakter)
       const simulated = content.replace(op.search, op.replace);
       const idx       = simulated.indexOf(op.replace);
       const start     = Math.max(0, idx - 20);
@@ -205,10 +211,50 @@ export async function runDryRun(filePath: string, opts: DryRunOptions = {}): Pro
     return result.status === "ASK_HUMAN" ? 2 : 1;
   }
 
-  // ── Adım 4: Policy Kernel Stub (Faz 3'e kadar) ─────────────────────────
-  // Gerçek Policy Kernel Faz 3'te eklenir.
-  // Şimdilik: Validation geçti = simüle edilmiş PERMIT
-  const policyNote = `${YELLOW}⚠ Policy Kernel Faz 3'te eklenecek — şu an simüle ediliyor${RESET}`;
+  // ── Adım 4: Policy Kernel — SAP-07 Fix ────────────────────────────────
+  // Stub kaldırıldı. evaluatePolicy() çağrısı:
+  //   - TypeScript domain kuralları önce (globalPolicyRegistry)
+  //   - DENY/BLOCK → dry-run reddedilir
+  //   - ASK_HUMAN → insan onayı beklenir
+  //   - PERMIT → Rust hard lock'ları devreye girer
+  const validatedDecision = result.data!;
+  const policyResult = await evaluatePolicy(validatedDecision);
+
+  if (policyResult.status === "DENY" || policyResult.status === "BLOCK") {
+    const redirect = policyResult.redirect ?? "Policy reddetti — DENY.";
+    if (opts.json) {
+      process.stdout.write(JSON.stringify({
+        status:   policyResult.status,
+        source:   policyResult.source,
+        redirect,
+      }) + "\n");
+    } else {
+      process.stderr.write(
+        `${RED}${BOLD}✗ ${policyResult.status}${RESET} — ${CYAN}${filePath}${RESET}\n\n` +
+        `  Kaynak  : ${policyResult.source}\n` +
+        `  Sebep   : ${redirect}\n\n`
+      );
+    }
+    return 1;
+  }
+
+  if (policyResult.status === "ASK_HUMAN") {
+    const redirect = policyResult.redirect ?? "İnsan onayı gerekli.";
+    if (opts.json) {
+      process.stdout.write(JSON.stringify({
+        status:   "ASK_HUMAN",
+        source:   policyResult.source,
+        redirect,
+      }) + "\n");
+    } else {
+      process.stdout.write(
+        `${YELLOW}${BOLD}⚠ ASK_HUMAN${RESET} — ${CYAN}${filePath}${RESET}\n\n` +
+        `  Kaynak  : ${policyResult.source}\n` +
+        `  Sebep   : ${redirect}\n\n`
+      );
+    }
+    return 2;
+  }
 
   // ── Adım 5: Diff Üret ─────────────────────────────────────────────────
   const diff = await generateDiff(raw);
@@ -216,7 +262,12 @@ export async function runDryRun(filePath: string, opts: DryRunOptions = {}): Pro
   if (opts.json) {
     process.stdout.write(JSON.stringify({
       status:      "PASS",
-      decision_id: result.data?.id,
+      decision_id: validatedDecision.id,
+      policy: {
+        source:   policyResult.source,
+        status:   policyResult.status,
+        duration: policyResult.duration_ms,
+      },
       diff,
     }) + "\n");
     return diff.found && diff.applied_ops === diff.total_ops ? 0 : 1;
@@ -225,11 +276,11 @@ export async function runDryRun(filePath: string, opts: DryRunOptions = {}): Pro
   // ── İnsan Okunabilir Çıktı ─────────────────────────────────────────────
   process.stdout.write(
     `\n${GREEN}${BOLD}✓ PASS${RESET} — ${CYAN}${filePath}${RESET}\n` +
-    `  Decision ID : ${result.data?.id}\n` +
+    `  Decision ID : ${validatedDecision.id}\n` +
     `  Intent      : ${raw.intent}\n` +
-    `  Risk        : ${result.data?.context.risk_level}\n` +
-    `  Confidence  : ${raw.confidence}\n\n` +
-    `${policyNote}\n`
+    `  Risk        : ${validatedDecision.context.risk_level}\n` +
+    `  Confidence  : ${raw.confidence}\n` +
+    `  Policy      : ${policyResult.status} (${policyResult.source}, ${policyResult.duration_ms}ms)\n\n`
   );
 
   printDiff(diff);
