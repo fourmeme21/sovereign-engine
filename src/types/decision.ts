@@ -46,22 +46,26 @@ export type Confidence = "HIGH" | "MEDIUM" | "LOW";
  * COMPLETED | REJECTED | BLOCKED → IMMUTABLE_STATE (yazılamaz)
  *
  * Geçiş tablosu (ARCHITECTURE.md §2.1):
- *   → PENDING           : Katman 1 — parse edildi
- *   PENDING → VALIDATED : Katman 2 — validasyon geçti
- *   PENDING → REJECTED  : Katman 1/2 — validasyon başarısız
- *   VALIDATED → POLICY_APPROVED : Katman 3 — PERMIT
- *   VALIDATED → BLOCKED         : Katman 3 — BLOCK
- *   POLICY_APPROVED → EXECUTING : Katman 4 — token doğrulandı
- *   EXECUTING → COMPLETED       : Katman 4 — başarılı
- *   EXECUTING → REJECTED        : Katman 4 — başarısız + rollback
+ *   → PENDING                    : Katman 1 — parse edildi
+ *   PENDING → VALIDATED          : Katman 2 — validasyon geçti
+ *   PENDING → REJECTED           : Katman 1/2 — validasyon başarısız
+ *   VALIDATED → POLICY_APPROVED  : Katman 3 — PERMIT
+ *   VALIDATED → PENDING_HUMAN    : Katman 3 — ASK_HUMAN; insan onayı bekleniyor
+ *   VALIDATED → BLOCKED          : Katman 3 — BLOCK
+ *   PENDING_HUMAN → POLICY_APPROVED : Katman 3 — insan onayladı, yeni token üretildi
+ *   PENDING_HUMAN → REJECTED     : TypeScript orchestration — retry_count >= 3 (TOKEN_RETRY_LIMIT)
+ *   POLICY_APPROVED → EXECUTING  : Katman 4 — token doğrulandı
+ *   EXECUTING → COMPLETED        : Katman 4 — başarılı
+ *   EXECUTING → REJECTED         : Katman 4 — başarısız + rollback
  */
 export type DecisionStatus =
   | "PENDING"          // Katman 1 atar
   | "VALIDATED"        // Katman 2 atar
   | "POLICY_APPROVED"  // Katman 3 atar
+  | "PENDING_HUMAN"    // Katman 3 atar — ASK_HUMAN; insan onayı bekleniyor
   | "EXECUTING"        // Katman 4 atar
   | "COMPLETED"        // Katman 4 atar — IMMUTABLE
-  | "REJECTED"         // Katman 1/2/4 atar — IMMUTABLE
+  | "REJECTED"         // Katman 1/2/4 veya TypeScript orchestration atar — IMMUTABLE
   | "BLOCKED";         // Katman 3 atar — IMMUTABLE
 
 /** Kilitli (IMMUTABLE) durumlar — bu durumlarda READ_DATA dışında işlem yapılamaz. */
@@ -212,6 +216,20 @@ export interface Decision {
 
   /** Mevcut katman durumu. */
   status: DecisionStatus;
+
+  /**
+   * PENDING_HUMAN → token expire döngüsü sayacı.
+   * TypeScript orchestration katmanı yönetir — Rust binary'e gönderilmez.
+   *
+   * - default: 0
+   * - max: 3 — 3'e ulaşınca otomatik REJECTED (TOKEN_RETRY_LIMIT)
+   * - Execution Gate EXPIRED_TOKEN döndürünce TypeScript retry_count++ yapar
+   * - retry_count < 3 → insan yeniden onaylayabilir, Policy yeni token üretir
+   * - retry_count >= 3 → status = "REJECTED", error_code: TOKEN_RETRY_LIMIT
+   *
+   * ARCHITECTURE.md §2.1, §3.3, §3.4 ve §7 (Shutdown)
+   */
+  retry_count?: number;
 
   /**
    * Hash chain — önceki AuditLog kaydının SHA-256 özeti.
