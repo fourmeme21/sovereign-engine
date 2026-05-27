@@ -9,7 +9,14 @@
  *   2. Her metodu implement et
  *   3. `validateContract()` tüm kontrolleri geçmeli
  *   4. registerPolicy() ile politikaları kaydet (policies.ts)
+ *
+ * SAP-03 FIX: preFlightRead(decision) eklendi — ValidationEngine entegrasyonu
+ * ARCH §3.5 güncelleme notu: execute/validateContract/SystemResponse kod versiyonu
+ * benimsendi (daha doğru tasarım — bkz. ARCHITECTURE.md §3.5 versiyon kaydı)
  */
+
+import type { Decision }        from "../../src/types/decision.js";
+import type { PreFlightResult } from "../../src/types/preflight.js";
 
 // ─── DOMAIN CONFIG ────────────────────────────────────────────────────────────
 
@@ -35,11 +42,11 @@ export interface DomainConfig {
 
 /** execute() çağrısına iletilen sistem bağlamı */
 export interface ExecutionContext {
-  actor_id: string;
+  actor_id:   string;
   actor_role: string;
   session_id: string;
-  bundle_id: string;
-  timestamp: string;
+  bundle_id:  string;
+  timestamp:  string;
 }
 
 // ─── ACTION RESULT ───────────────────────────────────────────────────────────
@@ -74,11 +81,28 @@ export interface DomainAdapter {
    */
   getConfig(): DomainConfig;
 
-  // ── PRE-FLIGHT OKUMA ─────────────────────────────────────────────────────
+  // ── PRE-FLIGHT — VALİDATION ENGINE ENTEGRASYONU ──────────────────────────
+
+  /**
+   * SAP-03 FIX: ValidationEngine.preFlightRead() bu metodu çağırır.
+   * assumed_state'in bayatlayıp bayatlamadığını kontrol eder.
+   *
+   * ARCH §3.5 + ValidationEngine PreFlightProvider interface'i ile uyumlu.
+   *
+   * @param decision - PENDING durumundaki Decision (assumed_state içerebilir)
+   * @returns PreFlightResult — clear:true = execution devam eder
+   *                          — clear:false = RE_EVALUATE veya REJECTED
+   */
+  preFlightRead(decision: Decision): Promise<PreFlightResult>;
+
+  // ── STATE SNAPSHOT — ROLLBACK İÇİN ──────────────────────────────────────
 
   /**
    * Execution öncesi mevcut state'i okur.
-   * assumed_state ile karşılaştırma için kullanılır (FP-U5).
+   * execute() öncesi çağrılır — dönen değer rollback() için backup olarak saklanır.
+   *
+   * preFlightRead'den farkı: bu metod rollback snapshot'ı için,
+   * preFlightRead assumed_state freshness kontrolü için kullanılır.
    *
    * @returns Mevcut state snapshot — rollback için saklanır
    * @throws Okuma başarısız olursa → execution iptal
@@ -99,8 +123,8 @@ export interface DomainAdapter {
    */
   execute(
     actionName: string,
-    params: unknown,
-    context: ExecutionContext,
+    params:     unknown,
+    context:    ExecutionContext,
   ): Promise<ActionResult>;
 
   // ── ROLLBACK ─────────────────────────────────────────────────────────────
