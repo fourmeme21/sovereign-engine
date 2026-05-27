@@ -9,10 +9,20 @@
  *   - Hard lock → değiştirilemez (Rust'ta)
  *   - Domain kural → domain adapter kayıt eder (burada)
  *   - Default → DENY (fail-closed)
+ *
+ * SAP-04 Fix (evaluatePolicy):
+ *   Domain config daha önce Rust'a hiç geçilmiyordu.
+ *   evaluatePolicy() orchestrator'ı:
+ *     1. TypeScript domain kurallarını önce çalıştırır
+ *     2. DENY/BLOCK/ASK_HUMAN → Rust'a gitmez, hemen döner (fail-closed)
+ *     3. PERMIT veya eşleşme yok → Rust policy kernel devreye girer
+ *     4. Rust sonucu nihai kararı verir (hard lock override edilemez)
  */
 
 import type { Decision }     from "../types/decision.js";
 import type { PolicyResult } from "../types/policy.js";
+import { callPolicyKernel }  from "./kernel-bridge.js";
+import type { KernelBridgeResult } from "./kernel-bridge.js";
 
 // ---------------------------------------------------------------------------
 // Domain Kural Tipi
@@ -194,5 +204,122 @@ export function domainResultToPolicyResult(
     priority:        result.priority ?? 0,
     redirect:        result.redirect,
     execution_token: undefined, // PERMIT ise kernel-bridge üretir
+  };
+}
+
+// ---------------------------------------------------------------------------
+// SAP-04: Policy Orchestrator
+// ---------------------------------------------------------------------------
+
+/**
+ * Orchestrator çıktı tipi.
+ * Hangi katmanın karar verdiğini, her iki sonucu ve toplam süreyi içerir.
+ */
+export interface OrchestratorResult {
+  /** Kararı veren katman */
+  source:         "domain_rules" | "rust_kernel" | "default_deny";
+  /** Nihai karar */
+  status:         "PERMIT" | "DENY" | "BLOCK" | "ASK_HUMAN" | "ERROR";
+  /** Rust PolicyResult — rust_kernel source'da dolu */
+  policy_result?: PolicyResult;
+  /** TypeScript domain kural sonucu — her zaman dolu */
+  domain_result:  DomainRuleEvaluationResult;
+  /** Rust kernel ham sonucu — rust_kernel source'da dolu */
+  kernel_result?: KernelBridgeResult;
+  /** Soft steer mesajı — DENY/BLOCK/ASK_HUMAN'da zorunlu */
+  redirect?:      string;
+  /** Toplam değerlendirme süresi */
+  duration_ms:    number;
+}
+
+/**
+ * SAP-04: Ana policy değerlendirme giriş noktası.
+ *
+ * Daha önce domain config Rust'a hiç geçilmiyordu.
+ * Bu fonksiyon iki katmanı sıralı çalıştırarak birleştirir:
+ *
+ * Akış:
+ *   1. TypeScript domain kuralları (globalPolicyRegistry) önce çalışır
+ *   2. Domain DENY / BLOCK  → fail-closed, Rust'a gitme, hemen dön
+ *   3. Domain ASK_HUMAN     → insan onayı iste, Rust'a gitme
+ *   4. Domain PERMIT veya eşleşme yok → Rust kernel (hard lock'lar) devreye girer
+ *   5. Rust sonucu nihai karardır — hard lock hiçbir şeyle override edilemez
+ *
+ * Fail-closed garantisi:
+ *   - Domain kuralı DENY/BLOCK → Rust hiç çağrılmaz
+ *   - Rust timeout/crash → DENY (kernel-bridge garantisi)
+ *   - Her iki katman da PERMIT demezse → DENY
+ *
+ * @param decision - VALIDATED durumundaki Decision objesi
+ */
+export async function evaluatePolicy(
+  decision: Decision
+): Promise<OrchestratorResult> {
+  const start = Date.now();
+
+  // ── AŞAMA 1: TypeScript domain kuralları ─────────────────────────────────
+  const domainResult = globalPolicyRegistry.evaluate(decision);
+
+  // Domain DENY → fail-closed, Rust'a gitme
+  if (
+    domainResult.matched &&
+    domainResult.outcome === "DENY"
+  ) {
+    return {
+      source:        "domain_rules",
+      status:        "DENY",
+      domain_result: domainResult,
+      redirect:      domainResult.redirect ?? "Domain kural reddetti — DENY.",
+      duration_ms:   Date.now() - start,
+    };
+  }
+
+  // Domain BLOCK → fail-closed, Rust'a gitme
+  if (
+    domainResult.matched &&
+    domainResult.outcome === "BLOCK"
+  ) {
+    return {
+      source:        "domain_rules",
+      status:        "BLOCK",
+      domain_result: domainResult,
+      redirect:      domainResult.redirect ?? "Domain kural engelledi — BLOCK.",
+      duration_ms:   Date.now() - start,
+    };
+  }
+
+  // Domain ASK_HUMAN → insan onayı iste, Rust'a gitme
+  if (
+    domainResult.matched &&
+    domainResult.outcome === "ASK_HUMAN"
+  ) {
+    return {
+      source:        "domain_rules",
+      status:        "ASK_HUMAN",
+      domain_result: domainResult,
+      redirect:      domainResult.redirect ?? "Domain kural insan onayı istedi.",
+      duration_ms:   Date.now() - start,
+    };
+  }
+
+  // ── AŞAMA 2: Rust policy kernel (hard lock'lar) ──────────────────────────
+  // Domain PERMIT veya eşleşme yok → Rust devreye girer.
+  // Rust hard lock'ları domain kurallarını override edebilir.
+  const kernelResult = await callPolicyKernel(decision);
+
+  // Rust ERROR → fail-closed DENY (kernel-bridge zaten DENY döndürür ama
+  // burada da açıkça yaz — CORE.md §9: "Fail-closed: şüphe durumunda DENY")
+  const status = kernelResult.status === "ERROR"
+    ? "DENY"
+    : kernelResult.status;
+
+  return {
+    source:        "rust_kernel",
+    status,
+    domain_result: domainResult,
+    kernel_result: kernelResult,
+    policy_result: kernelResult.policy_result,
+    redirect:      kernelResult.policy_result?.redirect,
+    duration_ms:   Date.now() - start,
   };
 }
