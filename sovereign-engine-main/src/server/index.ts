@@ -15,6 +15,16 @@ import githubRouter from './routes/githubRouter.js'
 import adminRouter from './routes/adminRouter.js'
 import dodoRouter  from './routes/dodoRouter.js'
 import aiProxy     from './routes/aiProxy.js'
+import jwt from 'jsonwebtoken'
+
+// ─── JWT SECRET ──────────────────────────────────────────────
+// Açık Sorun #1 fix: Secret env'den okunur — binary'e gömülü değil.
+// Railway Variables → JWT_SECRET eklenmeli. Rotation: env'i güncelle + redeploy.
+const JWT_SECRET = process.env['JWT_SECRET']
+if (!JWT_SECRET) {
+  console.error('[FATAL] JWT_SECRET env değişkeni tanımlanmamış — sistem başlamıyor.')
+  process.exit(1)
+}
 
 export type Verdict = 'PERMIT' | 'DENY' | 'ASK_HUMAN'
 export type Criticality = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
@@ -49,6 +59,22 @@ interface PatchInput {
   payload?: Record<string, unknown>; session_id?: string; agent?: string; timestamp?: string
 }
 
+
+// ─── JWT TOKEN ÜRETIMI ───────────────────────────────────────
+// Açık Sorun #1 fix: HS256 imzalı gerçek JWT — JWT_SECRET env'den okunur.
+// Payload ARCHITECTURE.md §2.2 ExecutionTokenPayload ile uyumlu.
+function issueToken(patch: PatchInput): string {
+  const decisionId = uuid()
+  const payload = {
+    decision_id:  decisionId,
+    actor_id:     patch.session_id ?? 'unknown',
+    action_name:  patch.action ?? 'EXECUTE_ACTION',
+    scope:        `${patch.target ?? 'DEFAULT'}:${patch.action ?? 'execute'}`,
+    issued_at:    Math.floor(Date.now() / 1000),
+    expires_at:   Math.floor(Date.now() / 1000) + 30,
+  }
+  return jwt.sign(payload, JWT_SECRET as string, { algorithm: 'HS256', expiresIn: 30 })
+}
 function evaluatePatch(patch: PatchInput): { verdict: Verdict; policy: string; reason: string; token: string | null } {
   const IMMUTABLE = ['system.config', 'audit.log', 'policy.kernel']
   const target = patch.target ?? ''
@@ -75,12 +101,12 @@ function evaluatePatch(patch: PatchInput): { verdict: Verdict; policy: string; r
         verdict: parsed.verdict ?? 'PERMIT',
         policy: parsed.policy_id ?? 'POL-007',
         reason: parsed.reason ?? 'CLI validation passed',
-        token: parsed.execution_token ?? `eyJhbGciOiJIUzI1NiJ9.${uuid().replace(/-/g, '').slice(0, 16)}`,
+        token: parsed.execution_token ?? issueToken(patch),
       }
     }
   } catch (_) {}
 
-  const token = `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ id: uuid(), exp: Date.now() + 30_000 })).toString('base64url')}`
+  const token = issueToken(patch)
   return { verdict: 'PERMIT', policy: 'POL-007', reason: 'All checks passed - execution token issued', token }
 }
 
