@@ -29,13 +29,8 @@ export interface WsMessage {
   decisions?: Decision[]; decision?: Decision
 }
 
-const decisionStore: Decision[] = [
-  { id: 'dec-8a3f2', action: 'MODIFY_STATE',   criticality: 'CRITICAL', verdict: 'ASK_HUMAN', policy: 'POL-011',        reason: 'Low confidence - human required',  token: null,                    time: '14:22:07', latency: '2.1ms' },
-  { id: 'dec-7b1e4', action: 'EXECUTE_ACTION', criticality: 'HIGH',     verdict: 'PERMIT',    policy: 'POL-007',        reason: 'All checks passed - token issued',  token: 'eyJhbGciOiJIUzI1NiJ9', time: '14:21:55', latency: '3.2ms' },
-  { id: 'dec-6c9d1', action: 'READ_STATE',     criticality: 'LOW',      verdict: 'PERMIT',    policy: 'POL-003',        reason: 'Read-only - auto permit',           token: 'eyJhbGciOiJIUzI1NiJ9', time: '14:20:40', latency: '0.8ms' },
-  { id: 'dec-5d2a8', action: 'MODIFY_STATE',   criticality: 'CRITICAL', verdict: 'DENY',      policy: 'POL-001 (HL-1)', reason: 'HL-1: Immutable resource blocked',  token: null,                    time: '14:18:33', latency: '1.1ms' },
-  { id: 'dec-4e0f3', action: 'EXECUTE_ACTION', criticality: 'MEDIUM',   verdict: 'PERMIT',    policy: 'POL-007',        reason: 'All checks passed - token issued',  token: 'eyJhbGciOiJIUzI1NiJ9', time: '14:17:12', latency: '2.9ms' },
-]
+// TB-10 fix: Mock veriler kaldırıldı — cold trigger'da gerçek Supabase verisi gelecek
+const decisionStore: Decision[] = []
 
 const MAX_DECISIONS = 200
 function addDecision(d: Decision) {
@@ -237,7 +232,13 @@ app.post('/api/apply', authMiddleware, tierGuard(), async (req, res) => {
       policy_verdict:  verdict,
       trace_id:        decision.id,
     }).then(({ error }) => {
-      if (error) console.error('[apply] Supabase insert error:', error.message)
+      if (error) {
+        console.error('[apply] Supabase insert error:', error.message)
+        broadcast({ type: 'decision', decision: {
+          ...decision,
+          reason: `[SYNC_ERROR] ${decision.reason} — DB yazılamadı: ${error.message}`,
+        }})
+      }
     })
   }
 })
