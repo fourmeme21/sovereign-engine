@@ -8,6 +8,9 @@ const claude = new Anthropic({
 })
 
 // ─── CHAT RISK SCORER ────────────────────────────────────────
+// TB-3 / Karar #20: Keyword heuristic kaldırıldı — fake risk skoru engine
+// güvenilirliğini düşürüyordu. Gerçek skor engine'den gelecek (Phase G sonrası).
+// Şimdilik sabit 2 (düşük risk) döner.
 interface ChatRiskResult {
   score:   number
   verdict: 'PERMIT' | 'ASK_HUMAN' | 'DENY'
@@ -15,65 +18,13 @@ interface ChatRiskResult {
   reason:  string
 }
 
-function scoreChatRisk(userMessage: string, assistantReply: string): ChatRiskResult {
-  const msg   = userMessage.toLowerCase()
-  const reply = assistantReply.toLowerCase()
-  let score   = 1
-  let reason  = 'Normal sohbet — düşük risk'
-
-  const CRITICAL = [
-    'rm -rf', 'drop table', 'truncate', 'delete from',
-    'wipe', 'format', 'destroy', 'remove all',
-  ]
-  const HIGH = [
-    'deploy', 'production', 'migrate', 'schema change',
-    'secret', 'api key', 'password', 'auth token', 'payment',
-  ]
-  const MEDIUM = [
-    'modify', 'update', 'alter', 'config',
-    'environment', 'setting', 'permission',
-  ]
-
-  for (const kw of CRITICAL) {
-    if (msg.includes(kw) || reply.includes(kw)) {
-      score  = Math.max(score, 9)
-      reason = `Kritik işlem tespit edildi: "${kw}"`
-      break
-    }
+function scoreChatRisk(_userMessage: string, _assistantReply: string): ChatRiskResult {
+  return {
+    score:   2,
+    verdict: 'PERMIT',
+    policy:  'POL-CHAT-001',
+    reason:  'Risk skoru engine entegrasyonu bekleniyor — geçici sabit değer',
   }
-
-  for (const kw of HIGH) {
-    if (msg.includes(kw)) {
-      score  = Math.max(score, 6)
-      reason = `Yüksek riskli alan: "${kw}"`
-    }
-  }
-
-  for (const kw of MEDIUM) {
-    if (msg.includes(kw)) {
-      score = Math.max(score, 3)
-    }
-  }
-
-  if (reply.includes('```')) {
-    score = Math.min(10, score + 1)
-  }
-
-  let verdict: ChatRiskResult['verdict']
-  let policy: string
-
-  if (score >= 8) {
-    verdict = 'DENY'
-    policy  = 'POL-CHAT-003'
-  } else if (score >= 5) {
-    verdict = 'ASK_HUMAN'
-    policy  = 'POL-CHAT-002'
-  } else {
-    verdict = 'PERMIT'
-    policy  = 'POL-CHAT-001'
-  }
-
-  return { score, verdict, policy, reason }
 }
 
 // ─── POST /api/ai/chat ────────────────────────────────────────
