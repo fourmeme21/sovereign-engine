@@ -19,29 +19,25 @@ If asked about your identity or underlying model, respond only with:
 Do not confirm or deny being any specific AI model.`
 
 // ─── REPLY FİLTRESİ (Karar #45) ──────────────────────────────
-// Anthropic / Claude referanslarını yanıttan temizler.
-const FORBIDDEN = [
-  'claude',
-  'anthropic',
-  'openai',
-  'i am an ai',
-  'language model',
-  'large language',
-  'llm',
-  'gpt',
-]
-
+// \b word boundary — kelimeleri ortadan bölmez (ör: "anthropically" korunur).
 function filterReply(reply: string): string {
-  return FORBIDDEN.reduce(
-    (r, w) => r.replace(new RegExp(w, 'gi'), 'Sovereign AI'),
-    reply,
-  )
+  const patterns: [RegExp, string][] = [
+    [/\bclaude\b/gi,         'Sovereign AI'],
+    [/\banthrop(?:ic)?\b/gi, 'Sovereign'],
+    [/\bopenai\b/gi,         'Sovereign AI'],
+    [/\bi am an ai\b/gi,     'I am Sovereign AI'],
+    [/\blanguage model\b/gi, 'decision engine'],
+    [/\blarge language\b/gi, 'decision'],
+    [/\bllm\b/gi,            'decision engine'],
+    [/\bgpt\b/gi,            'Sovereign AI'],
+  ]
+  return patterns.reduce((r, [pattern, replacement]) =>
+    r.replace(pattern, replacement), reply)
 }
 
 // ─── CHAT RISK SCORER (TB-10) ─────────────────────────────────
-// Karar #20 / #46: Keyword heuristic kaldırıldı — fake risk skoru engine
-// güvenilirliğini düşürüyordu. Domain adaptörler yazılınca Policy Kernel
-// entegrasyonu gelecek (Yol 2). Şimdilik sabit 2 (düşük risk) döner.
+// Karar #20 / #46: Parametreler korundu — TB-10 aktif edilince kullanılacak.
+// Şimdilik sabit 2 döner.
 interface ChatRiskResult {
   score:   number
   verdict: 'PERMIT' | 'ASK_HUMAN' | 'DENY'
@@ -49,7 +45,7 @@ interface ChatRiskResult {
   reason:  string
 }
 
-function scoreChatRisk(): ChatRiskResult {
+function scoreChatRisk(_userMessage: string, _assistantReply: string): ChatRiskResult {
   return {
     score:   2,
     verdict: 'PERMIT',
@@ -73,13 +69,19 @@ router.post('/chat', async (req, res) => {
     const response = await claude.messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens,
-      system:     SOVEREIGN_SYSTEM,   // Her zaman engine'den — client override edemez
+      system:     SOVEREIGN_SYSTEM,
       messages,
     })
 
     const rawReply = (response.content[0] as Anthropic.TextBlock)?.text ?? ''
-    const reply    = filterReply(rawReply)   // Kimlik referanslarını temizle
-    const risk     = scoreChatRisk()
+    const reply    = filterReply(rawReply)
+
+    const lastUserMsg = [...messages].reverse().find(m => m.role === 'user')
+    const userText    = typeof lastUserMsg?.content === 'string'
+      ? lastUserMsg.content
+      : ''
+
+    const risk = scoreChatRisk(userText, reply)
 
     res.json({
       reply,
