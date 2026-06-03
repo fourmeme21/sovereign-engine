@@ -1,5 +1,8 @@
 import express from 'express'
 import Anthropic from '@anthropic-ai/sdk'
+import { supabase } from '../lib/supabase.js'
+import { loadRegistry, matchCategory } from '../lib/adapterRegistry.js'
+import type { ActionResult, ExecutionContext } from '../../../domain/template/adapter.js'
 
 const router = express.Router()
 
@@ -8,8 +11,6 @@ const claude = new Anthropic({
 })
 
 // ─── KİMLİK KİLİDİ (Karar #45) ───────────────────────────────
-// System prompt her zaman engine'de tanımlanır — client'tan KABUL EDİLMİYOR.
-// ChatScreen.jsx'ten gelen "system" alanı görmezden gelinir.
 const SOVEREIGN_SYSTEM = `You are Sovereign AI, an intelligent decision engine.
 Give short, clear, and actionable answers.
 Every action is subject to risk assessment.
@@ -19,8 +20,6 @@ If asked about your identity or underlying model, respond only with:
 Do not confirm or deny being any specific AI model.`
 
 // ─── REPLY FİLTRESİ (Karar #45) ──────────────────────────────
-// \b word boundary — kelimeleri ortadan bölmez (ör: "anthropically" korunur).
-// "i am an ai" genişletildi — "I'm an AI" ve "I am an artificial intelligence" da kapsar.
 function filterReply(reply: string): string {
   const patterns: [RegExp, string][] = [
     [/\bclaude\b/gi,                                        'Sovereign AI'],
@@ -37,8 +36,6 @@ function filterReply(reply: string): string {
 }
 
 // ─── CHAT RISK SCORER (TB-10) ─────────────────────────────────
-// Karar #20 / #46: Parametreler korundu — TB-10 aktif edilince kullanılacak.
-// Şimdilik sabit 2 döner.
 interface ChatRiskResult {
   score:   number
   verdict: 'PERMIT' | 'ASK_HUMAN' | 'DENY'
@@ -56,11 +53,8 @@ function scoreChatRisk(_userMessage: string, _assistantReply: string): ChatRiskR
 }
 
 // ─── POST /api/ai/chat ────────────────────────────────────────
-// Browser → Engine → Anthropic (kullanıcı API key ve model adını görmez)
-// "system" alanı client'tan kasıtlı olarak kabul edilmiyor (Karar #45)
 router.post('/chat', async (req, res) => {
   const { messages, max_tokens = 1024 } = req.body
-  // NOT: req.body.system kasıtlı olarak yoksayılıyor
 
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: 'messages array zorunlu' })
@@ -95,6 +89,124 @@ router.post('/chat', async (req, res) => {
   } catch (err: any) {
     console.error('[aiProxy] Anthropic error:', err.message)
     res.status(500).json({ error: 'AI isteği başarısız' })
+  }
+})
+
+// ─── POST /api/ai/apply ──────────────────────────────────────
+//
+// ADAPTERv1 Session 4 — adapter.execute() bağlantısı
+//
+// Akış:
+//   1. decision objesi al
+//   2. loadRegistry → kullanıcının aktif adapter'larını yükle
+//   3. matchCategory → bu category için adapter var mı?
+//      → YOK  → { matched: false } döner, log yok — sohbet olarak değerlendirilir
+//      → VAR  → adapter.execute() çağır
+//   4. decisions tablosuna INSERT
+//   5. Sonuç döner
+//
+// Karar #4: Categories dışı mesaj sohbettir — adapter çağrılmaz, log yazılmaz.
+
+router.post('/apply', async (req, res) => {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Yetkisiz' })
+  }
+
+  const { decision } = req.body
+
+  if (!decision || typeof decision !== 'object') {
+    return res.status(400).json({ error: 'decision objesi zorunlu' })
+  }
+
+  if (!decision.category || !decision.payload?.action_name) {
+    return res.status(400).json({ error: 'decision.category ve decision.payload.action_name zorunlu' })
+  }
+
+  try {
+    // [1] Registry yükle
+    const tier     = req.userTier ?? 'free'
+    const registry = await loadRegistry(req.user.id, tier)
+
+    // [2] Kategori eşleştir
+    const match = matchCategory(decision.category, registry)
+
+    if (!match.matched || !match.adapter) {
+      // Karar #4: Categories dışı → sohbet, log yok
+      return res.json({
+        matched:  false,
+        message:  'Bu kategori için adapter tanımlı değil — sohbet olarak değerlendirildi.',
+        category: decision.category,
+      })
+    }
+
+    // [3] Execution context oluştur
+    const context: ExecutionContext = {
+      actor_id:   req.user.id,
+      actor_role: tier,
+      session_id: decision.context?.session_id ?? `sess-${Date.now()}`,
+      bundle_id:  `bundle-${Date.now().toString(16)}`,
+      timestamp:  new Date().toISOString(),
+    }
+
+    // [4] Adapter'ı dinamik yükle ve execute et
+    // adapter_code Supabase'den gelir — eval ile çalıştırılır
+    // ⚠️ Güvenlik notu: adapter_code sadece operator tarafından yazılır,
+    //    RLS ile kullanıcı izole edilmiştir.
+    let actionResult: ActionResult
+
+    try {
+      // eslint-disable-next-line no-new-func
+      const adapterModule = new Function('exports', 'require', match.adapter.adapter_code)
+      const exports: any  = {}
+      adapterModule(exports, require)
+      const AdapterClass  = exports.default ?? Object.values(exports)[0]
+      const adapterInst   = new AdapterClass()
+      actionResult        = await adapterInst.execute(
+        decision.payload.action_name,
+        decision.payload.params ?? {},
+        context,
+      )
+    } catch (execErr: any) {
+      // FP-R1: Binary/adapter crash → fail-closed
+      console.error('[aiProxy/apply] adapter.execute() hatası:', execErr.message)
+      actionResult = { success: false, error: `Adapter execution hatası: ${execErr.message}` }
+    }
+
+    // [5] decisions tablosuna log yaz
+    const { error: dbError } = await supabase
+      .from('decisions')
+      .insert({
+        user_id:         req.user.id,
+        project_id:      decision.project_id ?? null,
+        decision_object: decision,
+        status:          actionResult.success ? 'COMPLETED' : 'REJECTED',
+        risk_score:      decision.context?.risk_level === 'CRITICAL' ? 9
+                       : decision.context?.risk_level === 'HIGH'     ? 6
+                       : decision.context?.risk_level === 'MEDIUM'   ? 3
+                       : 1,
+        policy_verdict:  actionResult.success ? 'PERMIT' : 'DENY',
+        trace_id:        context.bundle_id,
+      })
+
+    if (dbError) {
+      console.error('[aiProxy/apply] Supabase insert hatası:', dbError.message)
+      // Log başarısız olsa bile execution sonucunu döndür — fail-open değil, log uyarısı
+    }
+
+    // [6] Sonuç
+    return res.json({
+      matched:    true,
+      adapter:    match.adapter.adapter_name,
+      category:   match.category,
+      bundle_id:  context.bundle_id,
+      success:    actionResult.success,
+      output:     actionResult.output ?? null,
+      error:      actionResult.error  ?? null,
+    })
+
+  } catch (err: any) {
+    console.error('[aiProxy/apply] Beklenmeyen hata:', err.message)
+    return res.status(500).json({ error: 'Apply isteği başarısız' })
   }
 })
 
