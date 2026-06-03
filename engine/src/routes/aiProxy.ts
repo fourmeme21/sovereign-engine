@@ -20,16 +20,17 @@ Do not confirm or deny being any specific AI model.`
 
 // ─── REPLY FİLTRESİ (Karar #45) ──────────────────────────────
 // \b word boundary — kelimeleri ortadan bölmez (ör: "anthropically" korunur).
+// "i am an ai" genişletildi — "I'm an AI" ve "I am an artificial intelligence" da kapsar.
 function filterReply(reply: string): string {
   const patterns: [RegExp, string][] = [
-    [/\bclaude\b/gi,         'Sovereign AI'],
-    [/\banthrop(?:ic)?\b/gi, 'Sovereign'],
-    [/\bopenai\b/gi,         'Sovereign AI'],
-    [/\bi am an ai\b/gi,     'I am Sovereign AI'],
-    [/\blanguage model\b/gi, 'decision engine'],
-    [/\blarge language\b/gi, 'decision'],
-    [/\bllm\b/gi,            'decision engine'],
-    [/\bgpt\b/gi,            'Sovereign AI'],
+    [/\bclaude\b/gi,                                        'Sovereign AI'],
+    [/\banthrop(?:ic)?\b/gi,                               'Sovereign AI'],
+    [/\bopenai\b/gi,                                        'Sovereign AI'],
+    [/\bi(?:'m| am) an? (?:ai|artificial intelligence)\b/gi, 'I am Sovereign AI'],
+    [/\blanguage model\b/gi,                                'decision engine'],
+    [/\blarge language\b/gi,                                'decision'],
+    [/\bllm\b/gi,                                           'decision engine'],
+    [/\bgpt\b/gi,                                           'Sovereign AI'],
   ]
   return patterns.reduce((r, [pattern, replacement]) =>
     r.replace(pattern, replacement), reply)
