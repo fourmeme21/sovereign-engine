@@ -35,6 +35,19 @@ function filterReply(reply: string): string {
 }
 
 // ─── CHAT RISK SCORER (TB-10) ─────────────────────────────────
+//
+// Hibrit yaklaşım:
+//   KAT-1: Hızlı kural filtresi — açık tehlikeleri yakala (<1ms, API yok)
+//   KAT-2: Claude risk analizi — sadece orta/yüksek riskli görünenlerde
+//   KAT-3: Default PERMIT — düşük risk, API çağrısı yok
+//
+// Politika referansları:
+//   POL-CHAT-001: Düşük risk — sohbet / okuma
+//   POL-CHAT-002: Orta risk — yazma / güncelleme
+//   POL-CHAT-003: Yüksek risk — silme / geri alınamaz işlem
+//   POL-CHAT-004: Kritik — toplu silme / veri imhası / finansal bağlayıcı
+//   POL-CHAT-DENY: Açık tehlike — kimlik bilgisi / zarar verici içerik
+
 interface ChatRiskResult {
   score:   number
   verdict: 'PERMIT' | 'ASK_HUMAN' | 'DENY'
@@ -42,13 +55,178 @@ interface ChatRiskResult {
   reason:  string
 }
 
-function scoreChatRisk(_userMessage: string, _assistantReply: string): ChatRiskResult {
-  return {
-    score:   2,
-    verdict: 'PERMIT',
-    policy:  'POL-CHAT-001',
-    reason:  'Risk skoru engine entegrasyonu bekleniyor — geçici sabit değer',
+// ── KAT-1: Hızlı kural filtresi ──────────────────────────────
+
+interface QuickFilterResult {
+  triggered: boolean
+  score:     number
+  verdict:   'PERMIT' | 'ASK_HUMAN' | 'DENY'
+  policy:    string
+  reason:    string
+}
+
+function quickRiskFilter(message: string): QuickFilterResult {
+  const msg = message.toLowerCase()
+
+  // DENY — açık tehlikeler (skor 10)
+  const denyPatterns: [RegExp, string][] = [
+    [/şifr[ei]\w*\s*(ver|gönder|yaz|paylaş)/i,       'Kimlik bilgisi talebi tespit edildi.'],
+    [/api.?key\w*\s*(ver|gönder|yaz|paylaş)/i,        'API anahtarı talebi tespit edildi.'],
+    [/token\w*\s*(ver|gönder|yaz|paylaş)/i,           'Token ifşası talebi tespit edildi.'],
+    [/tüm (kullanıcı|veri|kayıt).*(sil|temizle|uç)/i, 'Toplu veri imhası talebi tespit edildi.'],
+    [/veritaban.*(drop|truncate|delete from)/i,        'Tehlikeli veritabanı komutu tespit edildi.'],
+  ]
+
+  for (const [pattern, reason] of denyPatterns) {
+    if (pattern.test(msg)) {
+      return { triggered: true, score: 10, verdict: 'DENY', policy: 'POL-CHAT-DENY', reason }
+    }
   }
+
+  // ASK_HUMAN — yüksek risk (skor 7-9)
+  const askPatterns: [RegExp, string, number][] = [
+    [/(tüm|bütün|hepsini).*(sil|kaldır|temizle)/i,    'Toplu silme işlemi insan onayı gerektirir.', 9],
+    [/geri\s*al[ı]?namaz/i,                            'Geri alınamaz işlem insan onayı gerektirir.', 8],
+    [/(ödeme|fatura|finansal).*(onayla|gönder|işle)/i, 'Finansal işlem insan onayı gerektirir.', 9],
+    [/sözleşme.*(imzala|onayla|kabul)/i,               'Hukuki bağlayıcı işlem insan onayı gerektirir.', 9],
+    [/production.*(deploy|yayınla|güncelle)/i,         'Production değişikliği insan onayı gerektirir.', 8],
+    [/(hesap|üyelik).*(sil|kapat|sonlandır)/i,         'Hesap silme işlemi insan onayı gerektirir.', 8],
+    [/migration.*(çalıştır|uygula|run)/i,              'Veritabanı migrasyonu insan onayı gerektirir.', 8],
+  ]
+
+  for (const [pattern, reason, score] of askPatterns) {
+    if (pattern.test(msg)) {
+      return { triggered: true, score, verdict: 'ASK_HUMAN', policy: 'POL-CHAT-003', reason }
+    }
+  }
+
+  // Orta risk — Claude analizine gönder (skor 4)
+  const mediumPatterns: RegExp[] = [
+    /(güncelle|değiştir|düzenle|yaz|ekle|kaydet)/i,
+    /(oluştur|yarat|üret|generate)/i,
+    /(gönder|ilet|publish|yayınla)/i,
+    /delete_resource|write_resource/i,
+  ]
+
+  for (const pattern of mediumPatterns) {
+    if (pattern.test(msg)) {
+      return {
+        triggered: true,
+        score:     4,
+        verdict:   'PERMIT',
+        policy:    'POL-CHAT-002',
+        reason:    'Orta risk — Claude analizi gerekiyor.',
+      }
+    }
+  }
+
+  // Düşük risk — PERMIT (skor 2)
+  return {
+    triggered: false,
+    score:     2,
+    verdict:   'PERMIT',
+    policy:    'POL-CHAT-001',
+    reason:    'Düşük risk — sohbet veya okuma.',
+  }
+}
+
+// ── KAT-2: Claude risk analizi ───────────────────────────────
+
+async function analyzeRiskWithClaude(
+  userMessage:    string,
+  assistantReply: string,
+  claudeClient:   Anthropic,
+): Promise<ChatRiskResult> {
+  const prompt = `Sen bir güvenlik risk analiz motorusun. Kullanıcı mesajını ve AI yanıtını değerlendir.
+
+KULLANICI MESAJI:
+${userMessage}
+
+AI YANITI:
+${assistantReply}
+
+Aşağıdaki JSON formatında yanıt ver. SADECE JSON döndür, başka hiçbir şey ekleme:
+{
+  "score": <1-10 arası tam sayı>,
+  "verdict": "<PERMIT|ASK_HUMAN|DENY>",
+  "policy": "<POL-CHAT-001|POL-CHAT-002|POL-CHAT-003|POL-CHAT-004|POL-CHAT-DENY>",
+  "reason": "<tek cümle Türkçe açıklama>"
+}
+
+Skorlama kriterleri:
+- 1-3: Sohbet, okuma, bilgi sorgulama → PERMIT / POL-CHAT-001
+- 4-5: Yazma, güncelleme, oluşturma → PERMIT / POL-CHAT-002
+- 6-7: Silme, gönderme, publish → ASK_HUMAN / POL-CHAT-003
+- 8-9: Toplu işlem, finansal, hukuki, production → ASK_HUMAN / POL-CHAT-004
+- 10: Kimlik bilgisi ifşası, toplu veri imhası, zararlı içerik → DENY / POL-CHAT-DENY
+
+Karar kuralları:
+- score 1-5 → PERMIT
+- score 6-8 → ASK_HUMAN
+- score 9-10 → DENY
+- Şüphe durumunda skoru yükselt — fail-closed prensibi geçerli`
+
+  try {
+    const response = await claudeClient.messages.create({
+      model:      'claude-sonnet-4-20250514',
+      max_tokens: 200,
+      messages:   [{ role: 'user', content: prompt }],
+    })
+
+    const raw    = (response.content[0] as Anthropic.TextBlock)?.text ?? ''
+    const clean  = raw.replace(/```json|```/g, '').trim()
+    const parsed = JSON.parse(clean)
+
+    // Tip güvenliği — Claude beklenmedik değer dönerse fail-closed
+    const validVerdicts = ['PERMIT', 'ASK_HUMAN', 'DENY'] as const
+    const validPolicies = ['POL-CHAT-001', 'POL-CHAT-002', 'POL-CHAT-003', 'POL-CHAT-004', 'POL-CHAT-DENY'] as const
+
+    const score   = typeof parsed.score   === 'number' ? Math.min(10, Math.max(1, Math.round(parsed.score))) : 5
+    const verdict = validVerdicts.includes(parsed.verdict) ? parsed.verdict : 'ASK_HUMAN'
+    const policy  = validPolicies.includes(parsed.policy)  ? parsed.policy  : 'POL-CHAT-002'
+    const reason  = typeof parsed.reason  === 'string'     ? parsed.reason  : 'Risk analizi tamamlandı.'
+
+    return { score, verdict, policy, reason }
+
+  } catch (err: any) {
+    // Analiz başarısız → fail-closed: ASK_HUMAN
+    console.warn('[scoreChatRisk] Claude analiz hatası — fail-closed ASK_HUMAN:', err.message)
+    return {
+      score:   6,
+      verdict: 'ASK_HUMAN',
+      policy:  'POL-CHAT-002',
+      reason:  'Risk analizi tamamlanamadı — güvenli tarafta kalınıyor.',
+    }
+  }
+}
+
+// ── ANA SCORER ───────────────────────────────────────────────
+
+async function scoreChatRisk(
+  userMessage:    string,
+  assistantReply: string,
+  claudeClient:   Anthropic,
+): Promise<ChatRiskResult> {
+
+  // KAT-1: Hızlı filtre
+  const quick = quickRiskFilter(userMessage)
+
+  // DENY veya yüksek ASK_HUMAN → Claude'a gitme, direkt dön
+  if (quick.verdict === 'DENY') {
+    return { score: quick.score, verdict: quick.verdict, policy: quick.policy, reason: quick.reason }
+  }
+
+  if (quick.verdict === 'ASK_HUMAN' && quick.score >= 7) {
+    return { score: quick.score, verdict: quick.verdict, policy: quick.policy, reason: quick.reason }
+  }
+
+  // KAT-2: Orta risk → Claude analizi
+  if (quick.score >= 4) {
+    return analyzeRiskWithClaude(userMessage, assistantReply, claudeClient)
+  }
+
+  // KAT-3: Düşük risk → direkt PERMIT
+  return { score: quick.score, verdict: quick.verdict, policy: quick.policy, reason: quick.reason }
 }
 
 // ─── POST /api/ai/chat ────────────────────────────────────────
@@ -86,7 +264,7 @@ router.post('/chat', async (req, res) => {
       ? lastUserMsg.content
       : ''
 
-    const risk = scoreChatRisk(userText, reply)
+    const risk = await scoreChatRisk(userText, reply, claude)
 
     // ── Bağlam Enjeksiyonu ────────────────────────────────────────────────
     // Token kullanımını kaydet, eşik aşıldıysa enjeksiyon içeriği al.
