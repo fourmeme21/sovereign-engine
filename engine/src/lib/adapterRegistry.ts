@@ -2,6 +2,7 @@
  * engine/src/lib/adapterRegistry.ts
  *
  * Adapter Registry — ADAPTERv1 Session 4
+ * FIX-2 (Session 9): buildSessionSummary iş dili — Karar #1 uyumu
  *
  * Görev:
  *   - Kullanıcıya ait aktif adapter'ları Supabase'den yükler
@@ -227,12 +228,34 @@ export async function registerAdapter(
  * Session başında kullanıcıya gösterilecek iş dili özeti üretir.
  *
  * Karar #1: Adapter kullanıcıya gösterilmez — etkileri iş diliyle gösterilir.
+ * FIX-2 (Session 9): Adapter adı + teknik kategori kaldırıldı — iş dili etiketleri eklendi.
+ *
+ * TODO (v1.2): user_adapters tablosuna human_label kolonu eklenince
+ *              CATEGORY_LABELS sabit map'i kaldırılabilir — adapter kendisi tanımlar.
  *
  * Örnek çıktı:
  *   "Bu session'da şu kararlar alınabilir:
- *    - Not oluşturma ve güncelleme (WRITE_RESOURCE)
- *    - Not silme (DELETE_RESOURCE)"
+ *    - Kayıt oluşturma ve güncelleme
+ *    - Kayıt silme"
  */
+
+// Teknik kategori → iş dili etiket haritası
+// Bilinmeyen kategori için fallback: kategori adının kendisi gösterilir.
+const CATEGORY_LABELS: Record<string, string> = {
+  WRITE_RESOURCE:  'Kayıt oluşturma ve güncelleme',
+  DELETE_RESOURCE: 'Kayıt silme',
+  READ_RESOURCE:   'Kayıt okuma',
+  APPROVE:         'Onay verme',
+  REJECT:          'Reddetme',
+  ASSIGN:          'Atama yapma',
+  NOTIFY:          'Bildirim gönderme',
+  SCHEDULE:        'Zamanlama ve planlama',
+  TRANSFER:        'Transfer işlemi',
+  CALCULATE:       'Hesaplama',
+  EXPORT:          'Dışa aktarma',
+  IMPORT:          'İçe aktarma',
+};
+
 export function buildSessionSummary(registry: RegistryResult): string {
   if (registry.adapterCount === 0) {
     return 'Henüz adapter tanımlanmamış — master planını yaz, sistem otomatik kurar.';
@@ -240,8 +263,9 @@ export function buildSessionSummary(registry: RegistryResult): string {
 
   const lines: string[] = ['Bu session\'da şu kararlar alınabilir:'];
 
-  for (const [category, adapter] of registry.categoryMap) {
-    lines.push(`  - ${adapter.adapter_name} → ${category}`);
+  for (const [category] of registry.categoryMap) {
+    const label = CATEGORY_LABELS[category] ?? category;
+    lines.push(`  - ${label}`);
   }
 
   return lines.join('\n');
