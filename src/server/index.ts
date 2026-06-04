@@ -2,28 +2,31 @@ import express from 'express'
 import http from 'http'
 import { WebSocketServer, WebSocket } from 'ws'
 import cors from 'cors'
+import rateLimit from 'express-rate-limit'
 import { v4 as uuid } from 'uuid'
 import { execSync } from 'child_process'
 import fs from 'fs'
 import path from 'path'
-import crypto from 'crypto'
-import { createClient } from '@supabase/supabase-js'
-import memoryRouter from '../../engine/src/routes/memoryRouter.js'
-import { processFileUpload } from '../../engine/src/memory/chunkPipeline.js'
-import githubRouter from '../routes/github.js'
-import dodoRouter from '../routes/dodoRouter.js'
-import { authMiddleware } from '../../engine/src/middleware/authMiddleware.js'
+import { supabase }         from '../../engine/src/lib/supabase.js'
+import { authMiddleware }   from '../../engine/src/middleware/authMiddleware.js'
+import { tierGuard }        from '../../engine/src/middleware/tierGuard.js'
+import memoryRouter         from '../../engine/src/routes/memoryRouter.js'
+import githubRouter         from '../routes/github.js'
+import adminRouter          from '../../engine/src/routes/adminRouter.js'
+import dodoRouter           from '../routes/dodoRouter.js'
+import aiProxy              from '../../engine/src/routes/aiProxy.js'
+import projectRouter        from '../../engine/src/routes/projectRouter.js'
+import { preloadProjectCache } from '../../engine/src/lib/contextInjector.js'
+import jwt from 'jsonwebtoken'
 
-const supabase = createClient(
-  process.env['SUPABASE_URL']!,
-  process.env['SUPABASE_SERVICE_KEY']!
-)
+// ─── JWT SECRET ──────────────────────────────────────────────
+const JWT_SECRET = process.env['JWT_SECRET']
+if (!JWT_SECRET) {
+  console.error('[FATAL] JWT_SECRET env değişkeni tanımlanmamış — sistem başlamıyor.')
+  process.exit(1)
+}
 
-// PROJECT_ID — sadece GitHub webhook için (server config, user context yok)
-// Hardcoded UUID fallback kaldırıldı — env var tanımlı olmalı
-const WEBHOOK_PROJECT_ID = process.env['PROJECT_ID']
-
-export type Verdict = 'PERMIT' | 'DENY' | 'ASK_HUMAN'
+export type Verdict     = 'PERMIT' | 'DENY' | 'ASK_HUMAN'
 export type Criticality = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
 
 export interface Decision {
@@ -36,13 +39,7 @@ export interface WsMessage {
   decisions?: Decision[]; decision?: Decision
 }
 
-const decisionStore: Decision[] = [
-  { id: 'dec-8a3f2', action: 'MODIFY_STATE',   criticality: 'CRITICAL', verdict: 'ASK_HUMAN', policy: 'POL-011',        reason: 'Low confidence — human required',   token: null,                    time: '14:22:07', latency: '2.1ms' },
-  { id: 'dec-7b1e4', action: 'EXECUTE_ACTION', criticality: 'HIGH',     verdict: 'PERMIT',    policy: 'POL-007',        reason: 'All checks passed — token issued',   token: 'eyJhbGciOiJIUzI1NiJ9', time: '14:21:55', latency: '3.2ms' },
-  { id: 'dec-6c9d1', action: 'READ_STATE',      criticality: 'LOW',      verdict: 'PERMIT',    policy: 'POL-003',        reason: 'Read-only — auto permit',            token: 'eyJhbGciOiJIUzI1NiJ9', time: '14:20:40', latency: '0.8ms' },
-  { id: 'dec-5d2a8', action: 'MODIFY_STATE',    criticality: 'CRITICAL', verdict: 'DENY',      policy: 'POL-001 (HL-1)', reason: 'HL-1: Immutable resource blocked',   token: null,                    time: '14:18:33', latency: '1.1ms' },
-  { id: 'dec-4e0f3', action: 'EXECUTE_ACTION',  criticality: 'MEDIUM',   verdict: 'PERMIT',    policy: 'POL-007',        reason: 'All checks passed — token issued',   token: 'eyJhbGciOiJIUzI1NiJ9', time: '14:17:12', latency: '2.9ms' },
-]
+const decisionStore: Decision[] = []
 
 const MAX_DECISIONS = 200
 function addDecision(d: Decision) {
@@ -59,6 +56,20 @@ function broadcast(msg: WsMessage) {
 interface PatchInput {
   action?: string; target?: string; criticality?: Criticality
   payload?: Record<string, unknown>; session_id?: string; agent?: string; timestamp?: string
+}
+
+// ─── JWT TOKEN ÜRETIMI ───────────────────────────────────────
+function issueToken(patch: PatchInput): string {
+  const decisionId = uuid()
+  const payload = {
+    decision_id:  decisionId,
+    actor_id:     patch.session_id ?? 'unknown',
+    action_name:  patch.action ?? 'EXECUTE_ACTION',
+    scope:        `${patch.target ?? 'DEFAULT'}:${patch.action ?? 'execute'}`,
+    issued_at:    Math.floor(Date.now() / 1000),
+    expires_at:   Math.floor(Date.now() / 1000) + 30,
+  }
+  return jwt.sign(payload, JWT_SECRET as string, { algorithm: 'HS256', expiresIn: 30 })
 }
 
 function evaluatePatch(patch: PatchInput): { verdict: Verdict; policy: string; reason: string; token: string | null } {
@@ -85,26 +96,27 @@ function evaluatePatch(patch: PatchInput): { verdict: Verdict; policy: string; r
       const parsed = JSON.parse(result)
       return {
         verdict: parsed.verdict ?? 'PERMIT',
-        policy: parsed.policy_id ?? 'POL-007',
-        reason: parsed.reason ?? 'CLI validation passed',
-        token: parsed.execution_token ?? `eyJhbGciOiJIUzI1NiJ9.${uuid().replace(/-/g, '').slice(0, 16)}`,
+        policy:  parsed.policy_id ?? 'POL-007',
+        reason:  parsed.reason ?? 'CLI validation passed',
+        token:   parsed.execution_token ?? issueToken(patch),
       }
     }
   } catch (_) {}
 
-  const token = `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ id: uuid(), exp: Date.now() + 30_000 })).toString('base64url')}`
-  return { verdict: 'PERMIT', policy: 'POL-007', reason: 'All checks passed — execution token issued', token }
+  const token = issueToken(patch)
+  return { verdict: 'PERMIT', policy: 'POL-007', reason: 'All checks passed - execution token issued', token }
 }
 
+// ─── MCP Proxy ───────────────────────────────────────────────
 const MCP_URL = process.env['MCP_URL'] ?? ''
 
 async function mcpProxy(subpath: string, body?: unknown) {
   if (!MCP_URL) return { ok: false, error: 'MCP_NOT_CONFIGURED', hint: 'Set MCP_URL env variable to your local mcp-server ngrok URL' }
   try {
     const res = await fetch(`${MCP_URL}${subpath}`, {
-      method: body ? 'POST' : 'GET',
+      method:  body ? 'POST' : 'GET',
       headers: { 'Content-Type': 'application/json' },
-      body: body ? JSON.stringify(body) : undefined,
+      body:    body ? JSON.stringify(body) : undefined,
     })
     const data = await res.json()
     return { ok: res.ok, ...data }
@@ -115,140 +127,76 @@ async function mcpProxy(subpath: string, body?: unknown) {
 }
 
 const app = express()
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT'] }))
 
-// ─── RAW BODY ROUTES (express.json()'dan önce) ───────────────
-app.post('/webhooks/github', express.raw({ type: '*/*' }), async (req, res) => {
-  const signature = (req.headers['x-hub-signature-256'] as string) ?? ''
-  const secret    = process.env['GITHUB_WEBHOOK_SECRET'] ?? ''
+// ─── CORS ────────────────────────────────────────────────────
+const ALLOWED_ORIGINS = [
+  process.env['APP_URL'],
+  process.env['ALLOWED_ORIGIN'],
+  'http://localhost:5173',
+  'http://localhost:4173',
+].filter(Boolean) as string[]
 
-  const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body)
-  const digest  = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex')
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true)
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true)
+    callback(new Error(`CORS: izin verilmeyen origin — ${origin}`))
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-password'],
+}))
 
-  const digestBuf = Buffer.from(digest)
-  const sigBuf    = Buffer.from(signature)
-
-  try {
-    if (digestBuf.length !== sigBuf.length || !crypto.timingSafeEqual(digestBuf, sigBuf))
-      return res.status(401).json({ error: 'Invalid signature' })
-  } catch {
-    return res.status(401).json({ error: 'Invalid signature' })
-  }
-
-  const event   = req.headers['x-github-event'] as string
-  const payload = JSON.parse(rawBody.toString())
-
-  res.status(200).json({ ok: true })
-
-  if (event === 'push') {
-    // Webhook server-to-server — WEBHOOK_PROJECT_ID env var gerekli
-    if (!WEBHOOK_PROJECT_ID) {
-      console.warn('[webhook] PROJECT_ID env var tanımlı değil — commit_index yazılmıyor')
-      return
-    }
-
-    const { commits, ref } = payload
-    const branch = ref.replace('refs/heads/', '')
-
-    for (const commit of commits) {
-      const { error: upsertError } = await supabase.from('commit_index').upsert({
-        project_id: WEBHOOK_PROJECT_ID,
-        commit_hash: commit.id,
-        parent_hash: commit.parents?.[0]?.sha ?? null,
-        message: commit.message,
-        author: commit.author.name,
-        timestamp: commit.timestamp,
-        files_changed: {
-          added: commit.added ?? [],
-          modified: commit.modified ?? [],
-          deleted: commit.removed ?? [],
-        },
-        branch,
-        architectural_impact_score: [
-          ...(commit.modified ?? []),
-          ...(commit.added ?? []),
-        ].some((f: string) =>
-          ['auth','payment','security','middleware','schema'].some(p => f.toLowerCase().includes(p))
-        ) ? 0.8 : 0.3,
-      })
-
-      if (upsertError) console.error('[webhook] upsert error:', upsertError.message)
-
-      const allFiles = [
-        ...(commit.added ?? []).map((f: string) => ({ file: f, type: 'added' })),
-        ...(commit.modified ?? []).map((f: string) => ({ file: f, type: 'modified' })),
-        ...(commit.removed ?? []).map((f: string) => ({ file: f, type: 'deleted' })),
-      ]
-
-      for (const { file, type } of allFiles) {
-        const { error: insertError } = await supabase.from('commit_file_changes').insert({
-          project_id: WEBHOOK_PROJECT_ID,
-          commit_hash: commit.id,
-          file_path: file,
-          change_type: type,
-          committed_at: commit.timestamp,
-        })
-        if (insertError) console.error('[webhook] insert error:', insertError.message)
-
-        if (type !== 'deleted') {
-          void (async () => {
-            try {
-              const rawBase = `https://raw.githubusercontent.com/${payload.repository.full_name}`
-              const [afterRes, beforeRes] = await Promise.allSettled([
-                fetch(`${rawBase}/${commit.id}/${file}`),
-                fetch(`${rawBase}/${commit.id}~1/${file}`),
-              ])
-
-              const afterContent = afterRes.status === 'fulfilled' && afterRes.value.ok
-                ? await afterRes.value.text()
-                : null
-
-              if (!afterContent) return
-
-              const beforeContent = beforeRes.status === 'fulfilled' && beforeRes.value.ok
-                ? await beforeRes.value.text()
-                : ""
-
-              await processFileUpload(
-                WEBHOOK_PROJECT_ID,
-                file,
-                afterContent,
-                commit.id,
-                branch,
-                beforeContent,
-              )
-            } catch (err) {
-              console.error(`[webhook diff] ${file}`, err)
-            }
-          })()
-        }
-      }
-    }
-  }
-})
-
-// Dodo webhook — raw body, express.json()'dan önce
-app.post('/api/dodo/webhook', express.raw({ type: 'application/json' }), (req, _res, next) => {
-  (req as any).rawBody = Buffer.isBuffer(req.body) ? req.body.toString() : String(req.body)
+// ─── Webhook raw body (express.json'dan ÖNCE) ────────────────
+app.use('/api/billing/webhook', express.raw({ type: 'application/json' }), (req, _res, next) => {
+  ;(req as any).rawBody = (req.body as Buffer).toString('utf8')
   next()
 })
 
-// ─── JSON MIDDLEWARE ──────────────────────────────────────────
-app.use(express.json({ limit: '1mb' }))
+// ─── Body parser ─────────────────────────────────────────────
+app.use(express.json({ limit: '2mb' }))
 
-app.get('/health', (_, res) => res.json({ status: 'ok', decisions: decisionStore.length, uptime: process.uptime() }))
-app.get('/api/decisions', (_, res) => res.json(decisionStore))
+// ─── Rate limiting ───────────────────────────────────────────
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Çok fazla istek — lütfen bekle.' },
+})
 
-app.get('/api/policies', (_, res) => res.json([
+const aiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'AI rate limit aşıldı.' },
+})
+
+app.use(globalLimiter)
+app.use('/api/ai', aiLimiter)
+
+// ─── Açık route'lar ──────────────────────────────────────────
+app.get('/health', (_, res) => res.json({
+  status: 'ok',
+  decisions: decisionStore.length,
+  uptime: process.uptime(),
+}))
+
+// ─── Korumalı route'lar ───────────────────────────────────────
+app.get('/api/decisions', authMiddleware, tierGuard(), (_, res) => {
+  res.json(decisionStore)
+})
+
+app.get('/api/policies', authMiddleware, (_, res) => res.json([
   { id: 'POL-001', label: 'POL-001 · HL-1 · Immutable State',  meta: 'HL-1 · Immutable State Guard · HARD_LOCK',  type: 'HARD_LOCK',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    let immutable = vec!["system.config","audit.log","policy.kernel"];\n    if decision.action == ActionType::ModifyState {\n        for resource in &immutable {\n            if decision.target.contains(resource) {\n                return PolicyResult { verdict: Verdict::Deny, reason: format!("HL-1: Immutable \'{}\' blocked", resource), policy_id: "POL-001", token: None };\n            }\n        }\n    }\n    PolicyResult::pass()\n}' },
-  { id: 'POL-002', label: 'POL-002 · HL-2 · Non-Negative',      meta: 'HL-2 · Non-Negative Value Guard',           type: 'HARD_LOCK',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    if let Some(amount) = decision.payload.get("amount") {\n        if amount.as_f64().unwrap_or(0.0) < 0.0 {\n            return PolicyResult::deny("HL-2: Negative amount rejected");\n        }\n    }\n    PolicyResult::pass()\n}' },
-  { id: 'POL-003', label: 'POL-003 · HL-3 · Critical→Human',    meta: 'HL-3 · Critical Escalation · HARD_LOCK',    type: 'HARD_LOCK',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    if decision.criticality == Criticality::Critical {\n        return PolicyResult::ask_human("HL-3: Critical risk requires review");\n    }\n    PolicyResult::pass()\n}' },
-  { id: 'POL-004', label: 'POL-004 · HL-4 · Ownership',          meta: 'HL-4 · Resource Ownership Guard',           type: 'ENFORCING',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    PolicyResult::pass()\n}' },
-  { id: 'POL-007', label: 'POL-007 · Execution Token',            meta: 'Execution Token Validation · ENFORCING',   type: 'ENFORCING',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    PolicyResult::permit_with_token(ctx.issue_token(decision))\n}' },
-  { id: 'POL-011', label: 'POL-011 · Human Escalation',           meta: 'Low Confidence → ASK_HUMAN',               type: 'SOFT_STEER', code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    if decision.confidence < 0.7 {\n        return PolicyResult::ask_human("Low confidence — operator review");\n    }\n    PolicyResult::pass()\n}' },
+  { id: 'POL-002', label: 'POL-002 · HL-2 · Non-Negative',     meta: 'HL-2 · Non-Negative Value Guard',           type: 'HARD_LOCK',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    if let Some(amount) = decision.payload.get("amount") {\n        if amount.as_f64().unwrap_or(0.0) < 0.0 {\n            return PolicyResult::deny("HL-2: Negative amount rejected");\n        }\n    }\n    PolicyResult::pass()\n}' },
+  { id: 'POL-003', label: 'POL-003 · HL-3 · Critical->Human',  meta: 'HL-3 · Critical Escalation · HARD_LOCK',    type: 'HARD_LOCK',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    if decision.criticality == Criticality::Critical {\n        return PolicyResult::ask_human("HL-3: Critical risk requires review");\n    }\n    PolicyResult::pass()\n}' },
+  { id: 'POL-004', label: 'POL-004 · HL-4 · Ownership',        meta: 'HL-4 · Resource Ownership Guard',           type: 'ENFORCING',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    PolicyResult::pass()\n}' },
+  { id: 'POL-007', label: 'POL-007 · Execution Token',          meta: 'Execution Token Validation · ENFORCING',   type: 'ENFORCING',  code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    PolicyResult::permit_with_token(ctx.issue_token(decision))\n}' },
+  { id: 'POL-011', label: 'POL-011 · Human Escalation',         meta: 'Low Confidence -> ASK_HUMAN',              type: 'SOFT_STEER', code: 'fn evaluate(decision: &Decision, ctx: &PolicyContext) -> PolicyResult {\n    if decision.confidence < 0.7 {\n        return PolicyResult::ask_human("Low confidence - operator review");\n    }\n    PolicyResult::pass()\n}' },
 ]))
 
-app.get('/api/session', (_, res) => {
+app.get('/api/session', authMiddleware, (_, res) => {
   const permits = decisionStore.filter(d => d.verdict === 'PERMIT').length
   const denies  = decisionStore.filter(d => d.verdict === 'DENY').length
   const human   = decisionStore.filter(d => d.verdict === 'ASK_HUMAN').length
@@ -267,76 +215,77 @@ app.get('/api/session', (_, res) => {
       { faz: 'FAZ 4', title: 'Execution Gate (Rust)', done: true,  active: false },
       { faz: 'FAZ 5', title: 'Domain Adapter',        done: true,  active: false },
       { faz: 'FAZ 6', title: 'Dashboard',             done: true,  active: true  },
-      { faz: 'FAZ 7', title: 'NotebookLM MCP',        done: false, active: false },
+      { faz: 'FAZ 7', title: 'ADAPTERv1',             done: false, active: true  },
     ],
-    issues: [
-      { id: 'ISSUE-001', level: 'warning', desc: 'execution_token JWT secret yönetimi belirsiz' },
-      { id: 'ISSUE-006', level: 'warning', desc: 'CLI testleri test.skip — ESM mock kısıtlaması' },
-    ],
+    issues: [],
     mcp: { configured: !!MCP_URL, url: MCP_URL || null },
   })
 })
 
-// ─── /api/apply — authMiddleware eklendi, Supabase'e user_id ile yazılıyor ───
-app.post('/api/apply', authMiddleware, async (req, res) => {
+app.post('/api/apply', authMiddleware, tierGuard(), async (req, res) => {
   const patch = req.body as PatchInput
   if (!patch || typeof patch !== 'object')
-    return res.status(400).json({ error: 'Invalid patch body — must be JSON object' })
+    return res.status(400).json({ error: 'Invalid patch body' })
 
-  const userId = (req as any).user.id
   const start = Date.now()
   const { verdict, policy, reason, token } = evaluatePatch(patch)
   const decision: Decision = {
-    id: `dec-${uuid().replace(/-/g, '').slice(0, 7)}`,
-    action: patch.action ?? 'EXECUTE_ACTION',
+    id:          `dec-${uuid().replace(/-/g, '').slice(0, 7)}`,
+    action:      patch.action ?? 'EXECUTE_ACTION',
     criticality: patch.criticality ?? 'MEDIUM',
     verdict, policy, reason, token,
-    time: new Date().toLocaleTimeString('tr-TR'),
-    latency: `${Date.now() - start}ms`,
+    time:        new Date().toLocaleTimeString('tr-TR'),
+    latency:     `${Date.now() - start}ms`,
   }
-
-  // Supabase'e user_id ile yaz — multi-tenant
-  const riskScore = { CRITICAL: 100, HIGH: 75, MEDIUM: 50, LOW: 25 }[decision.criticality] ?? 50
-  supabase.from('decisions').insert({
-    user_id: userId,
-    decision_object: patch,
-    status: verdict,
-    risk_score: riskScore,
-    policy_verdict: verdict,
-    trace_id: decision.id,
-  }).then(({ error }) => {
-    if (error) console.error('[apply] supabase insert error:', error.message)
-  })
-
   addDecision(decision)
   broadcast({ type: 'decision', decision })
   res.json(decision)
+
+  const userId = (req as any).user?.id
+  if (userId) {
+    const riskScore = patch.criticality === 'CRITICAL' ? 9
+      : patch.criticality === 'HIGH'   ? 7
+      : patch.criticality === 'MEDIUM' ? 5 : 2
+    supabase.from('decisions').insert({
+      user_id:         userId,
+      decision_object: decision,
+      status:          verdict === 'PERMIT' ? 'approved' : verdict === 'DENY' ? 'rejected' : 'pending',
+      risk_score:      riskScore,
+      policy_verdict:  verdict,
+      trace_id:        decision.id,
+    }).then(({ error }) => {
+      if (error) console.error('[apply] Supabase insert error:', error.message)
+    })
+  }
 })
 
-app.get('/mcp/status', async (_, res) => {
+// ─── MCP (korumalı) ──────────────────────────────────────────
+app.get('/mcp/status', authMiddleware, async (_, res) => {
   const result = await mcpProxy('/status')
   res.json(result)
 })
 
-app.post('/mcp/sync', async (req, res) => {
-  const body = req.body as { files?: string[] }
-  const result = await mcpProxy('/sync', body)
+app.post('/mcp/sync', authMiddleware, async (req, res) => {
+  const result = await mcpProxy('/sync', req.body)
   res.json(result)
 })
 
-app.post('/mcp/query', async (req, res) => {
-  const body = req.body as { question?: string }
-  if (!body?.question)
+app.post('/mcp/query', authMiddleware, async (req, res) => {
+  if (!req.body?.question)
     return res.status(400).json({ error: 'question field required' })
-  const result = await mcpProxy('/query', body)
+  const result = await mcpProxy('/query', req.body)
   res.json(result)
 })
 
-app.use('/memory', memoryRouter)
-app.use('/github', githubRouter)
-app.use('/api/dodo', dodoRouter)
-app.use('/api/billing', dodoRouter)
+// ─── Router'lar ───────────────────────────────────────────────
+app.use('/memory',       authMiddleware, tierGuard(), memoryRouter)
+app.use('/github',       authMiddleware, githubRouter)
+app.use('/admin',        adminRouter)
+app.use('/api/billing',  dodoRouter)
+app.use('/api/ai',       authMiddleware, aiProxy)
+app.use('/api/project',  authMiddleware, projectRouter)
 
+// ─── WebSocket ───────────────────────────────────────────────
 const server = http.createServer(app)
 const wss = new WebSocketServer({ server })
 
@@ -344,14 +293,30 @@ wss.on('connection', (ws) => {
   clients.add(ws)
   ws.send(JSON.stringify({ type: 'init', decisions: decisionStore } satisfies WsMessage))
   ws.on('message', (raw) => {
-    try { const msg = JSON.parse(raw.toString()); if (msg.type === 'ping') ws.send(JSON.stringify({ type: 'ping' })) } catch (_) {}
+    try {
+      const msg = JSON.parse(raw.toString())
+      if (msg.type === 'ping') ws.send(JSON.stringify({ type: 'ping' }))
+    } catch (_) {}
   })
   ws.on('close', () => clients.delete(ws))
   ws.on('error', (err) => console.error('[WS] Error:', err.message))
 })
 
 const PORT = parseInt(process.env['PORT'] ?? '8080', 10)
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ Sovereign Engine server :${PORT}`)
-  console.log(`🔗 MCP_URL: ${MCP_URL || '⚠️  not configured'}`)
+server.listen(PORT, '0.0.0.0', async () => {
+  console.log(`Sovereign Engine :${PORT}`)
+  console.log(`Origins: ${ALLOWED_ORIGINS.join(', ')}`)
+  console.log(`MCP_URL: ${MCP_URL || 'not configured'}`)
+  await preloadProjectCache()
 })
+
+// ─── RAILWAY KEEP-ALIVE ───────────────────────────────────────
+setInterval(() => {
+  const url = `http://localhost:${PORT}/health`
+  http.get(url, (res) => {
+    if (res.statusCode === 200)
+      console.log('[Keep-Alive] Ping başarılı:', new Date().toLocaleTimeString())
+  }).on('error', (err) => {
+    console.error('[Keep-Alive] Ping hatası:', err.message)
+  })
+}, 10 * 60 * 1000)
