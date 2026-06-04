@@ -148,24 +148,105 @@ router.post('/apply', async (req, res) => {
       timestamp:  new Date().toISOString(),
     }
 
-    // [4] Adapter'ı dinamik yükle ve execute et
-    // adapter_code Supabase'den gelir — eval ile çalıştırılır
-    // ⚠️ Güvenlik notu: adapter_code sadece operator tarafından yazılır,
-    //    RLS ile kullanıcı izole edilmiştir.
+    // [4] Adapter'ı vm sandbox ile yükle ve execute et — R-7 güvenlik geçişi
+    //
+    // Güvenlik katmanları:
+    //   KAT-1: Statik analiz  — yasak pattern tespiti (process, require, fs, eval...)
+    //   KAT-2: vm sandbox     — izole context, global erişim yok
+    //   KAT-3: Timeout        — 3000ms sınırı, sonsuz döngü koruması
+    //
+    // adapter_code Claude tarafından üretilir (operator kontrollü).
+    // RLS ile kullanıcı bazlı izolasyon Supabase katmanında sağlanır.
     let actionResult: ActionResult
 
     try {
-      // eslint-disable-next-line no-new-func
-      const adapterModule = new Function('exports', 'require', match.adapter.adapter_code)
-      const exports: any  = {}
-      adapterModule(exports, require)
-      const AdapterClass  = exports.default ?? Object.values(exports)[0]
-      const adapterInst   = new AdapterClass()
-      actionResult        = await adapterInst.execute(
+      // ── KAT-1: STATİK ANALİZ ──────────────────────────────────────────────
+      const FORBIDDEN_PATTERNS = [
+        'process.env',
+        'process.exit',
+        'child_process',
+        'require(',
+        '__dirname',
+        '__filename',
+        'fs.',
+        'fetch(',
+        'axios',
+        'XMLHttpRequest',
+        'eval(',
+        'new Function(',
+        'global.',
+        'globalThis.',
+      ]
+
+      for (const pattern of FORBIDDEN_PATTERNS) {
+        if (match.adapter.adapter_code.includes(pattern)) {
+          throw new Error(
+            `[R-7] Güvenlik ihlali: adapter_code yasak pattern içeriyor → "${pattern}"`,
+          )
+        }
+      }
+
+      // ── KAT-2: VM SANDBOX ─────────────────────────────────────────────────
+      // Sadece güvenli primitive'ler sandbox'a açılır.
+      // process, require, fs, global → tamamen kapalı.
+      const { createContext, Script } = await import('vm')
+
+      const sandboxExports: Record<string, unknown> = {}
+      const sandbox = createContext({
+        exports:    sandboxExports,
+        console: {
+          log:   (...args: unknown[]) => console.log('[adapter]', ...args),
+          warn:  (...args: unknown[]) => console.warn('[adapter]', ...args),
+          error: (...args: unknown[]) => console.error('[adapter]', ...args),
+        },
+        setTimeout,
+        clearTimeout,
+        Promise,
+        JSON,
+        Math,
+        Date,
+        Error,
+        Array,
+        Object,
+        String,
+        Number,
+        Boolean,
+        Map,
+        Set,
+      })
+
+      // ── KAT-3: TIMEOUT ────────────────────────────────────────────────────
+      // 3000ms — sonsuz döngü veya blocking I/O koruması.
+      const script = new Script(match.adapter.adapter_code)
+      script.runInContext(sandbox, { timeout: 3000 })
+
+      // Adapter sınıfını sandbox'tan al
+      const AdapterClass = (sandboxExports.default ??
+        Object.values(sandboxExports)[0]) as new () => {
+          execute: (action: string, params: Record<string, unknown>, ctx: ExecutionContext) => Promise<ActionResult>
+          validateContract: () => boolean
+        }
+
+      if (typeof AdapterClass !== 'function') {
+        throw new Error('[R-7] adapter_code geçerli bir sınıf export etmiyor.')
+      }
+
+      const adapterInst = new AdapterClass()
+
+      // validateContract() kontrolü — ARCHITECTURE.md Kural 11
+      if (typeof adapterInst.validateContract === 'function') {
+        const valid = adapterInst.validateContract()
+        if (!valid) {
+          throw new Error('[R-7] validateContract() false döndü — adapter yüklenemiyor.')
+        }
+      }
+
+      actionResult = await adapterInst.execute(
         decision.payload.action_name,
         decision.payload.params ?? {},
         context,
       )
+
     } catch (execErr: any) {
       // FP-R1: Binary/adapter crash → fail-closed
       console.error('[aiProxy/apply] adapter.execute() hatası:', execErr.message)
