@@ -1,7 +1,7 @@
 /**
  * engine/src/routes/projectRouter.ts
  *
- * Project Setup Engine — ADAPTERv1 Session 6
+ * Project Setup Engine — ADAPTERv1 Session 6 / Session 7 güncelleme
  *
  * Endpoint'ler:
  *   POST   /api/project/create          → Yeni proje + generation başlat
@@ -19,11 +19,17 @@
  *   #29: Master plan güncelleme → fark analizi
  *   #30: Project Setup Engine ayrı kurulum akışı
  *   #31: Akıllı paketleme — token sayacı engine'de değil istemcide yönetilir
+ *
+ * Session 7 değişiklikleri:
+ *   - generationEngine import edildi
+ *   - /create → runGeneration() arka planda tetikleniyor
+ *   - /status → ?resume=true query parametresiyle recovery tetikleniyor
  */
 
 import { Router, Request, Response } from 'express'
 import { supabase }                   from '../lib/supabase.js'
 import { authMiddleware }             from '../middleware/authMiddleware.js'
+import { runGeneration, resumeGeneration } from '../lib/generationEngine.js'
 
 // ---------------------------------------------------------------------------
 // TİP TANIMLARI
@@ -113,7 +119,7 @@ router.use(authMiddleware)
 // ═══════════════════════════════════════════════════════════════════════════
 // POST /api/project/create
 //
-// Yeni proje oluşturur. Generation akışını başlatır.
+// Yeni proje oluşturur. Generation akışını arka planda başlatır.
 // Tier limiti DB trigger'da da zorlanır — burada erken hata üretilir.
 //
 // Body:
@@ -140,7 +146,7 @@ router.post('/create', async (req: Request, res: Response): Promise<void> => {
 
   try {
     // Tier limiti kontrolü (erken hata)
-    const tier = await getUserTier(userId)
+    const tier    = await getUserTier(userId)
     const allowed = await checkProjectLimit(userId, tier)
 
     if (!allowed) {
@@ -217,15 +223,32 @@ router.post('/create', async (req: Request, res: Response): Promise<void> => {
       // Kritik değil — proje oluşturuldu, status sonradan eklenebilir
     }
 
+    // HTTP yanıtını gönder — kullanıcı beklemez
     res.status(201).json({
-      project_id:   (project as any).id,
-      project_name: (project as any).project_name,
-      project_slug: (project as any).project_slug,
-      gen_status:   (project as any).gen_status,
-      created_at:   (project as any).created_at,
+      project_id:    (project as any).id,
+      project_name:  (project as any).project_name,
+      project_slug:  (project as any).project_slug,
+      gen_status:    (project as any).gen_status,
+      created_at:    (project as any).created_at,
       pending_files: DEFAULT_FILES.map(f => f.file_name),
-      message:      'Proje oluşturuldu. Generation başlatılabilir.',
+      message:       'Proje oluşturuldu. Generation arka planda başladı.',
     })
+
+    // ── Generation arka planda başlat ──────────────────────────────────────
+    // setImmediate: yanıt gönderildikten sonra çalışır — kullanıcı beklemez
+    // master_plan yoksa generation tetiklenmez — masterplan yüklenince resume
+    if (master_plan) {
+      setImmediate(() => {
+        runGeneration({
+          projectId:   (project as any).id,
+          userId,
+          projectName: project_name.trim(),
+          masterPlan:  master_plan,
+        }).catch(err => {
+          console.error('[projectRouter/create] Generation background hatası:', err.message)
+        })
+      })
+    }
 
   } catch (err: any) {
     console.error('[projectRouter/create] Hata:', err.message)
@@ -266,6 +289,9 @@ router.get('/', async (req: Request, res: Response): Promise<void> => {
 //
 // Generation durumunu döner — recovery için kullanılır.
 // Hangi dosyalar tamamlandı, hangisi bekliyor.
+//
+// Query params:
+//   resume=true  → Yarım kalan generation'ı kaldığı yerden devam ettirir
 // ═══════════════════════════════════════════════════════════════════════════
 
 router.get('/:id/status', async (req: Request, res: Response): Promise<void> => {
@@ -303,6 +329,38 @@ router.get('/:id/status', async (req: Request, res: Response): Promise<void> => 
     let recovery_message: string | null = null
     if ((project as any).gen_status === 'in_progress' && pending.length > 0) {
       recovery_message = `Generation yarım kaldı. Sıradaki: "${pending[0].file_name}". Kaldığı yerden devam edebilirsin.`
+    }
+
+    // ── Recovery tetikleyici ─────────────────────────────────────────────
+    // GET /api/project/:id/status?resume=true → kaldığı yerden devam
+    if (
+      req.query.resume === 'true' &&
+      (project as any).gen_status !== 'completed'
+    ) {
+      const { data: mp } = await supabase
+        .from('user_projects')
+        .select('master_plan')
+        .eq('id', projectId)
+        .single()
+
+      const masterPlan = (mp as any)?.master_plan ?? ''
+
+      if (masterPlan) {
+        setImmediate(() => {
+          resumeGeneration(
+            projectId,
+            userId,
+            (project as any).project_name,
+            masterPlan,
+          ).catch(err => {
+            console.error('[projectRouter/resume] Background hatası:', err.message)
+          })
+        })
+
+        recovery_message = `Recovery tetiklendi. "${pending[0]?.file_name ?? 'sıradaki dosya'}"dan devam ediliyor.`
+      } else {
+        recovery_message = 'Recovery başlatılamadı: master_plan yok. Önce master plan yükle.'
+      }
     }
 
     res.json({
@@ -399,12 +457,12 @@ router.post('/:id/file', async (req: Request, res: Response): Promise<void> => {
       const { error: updateError } = await supabase
         .from('project_generation_status')
         .update({
-          status:       'completed',
-          completed_at: new Date().toISOString(),
+          status:        'completed',
+          completed_at:  new Date().toISOString(),
           error_message: null,
         })
         .eq('project_id', projectId)
-        .eq('file_name', file_name)
+        .eq('file_name',  file_name)
 
       if (updateError) throw updateError
     } else {
@@ -466,7 +524,7 @@ router.post('/:id/file', async (req: Request, res: Response): Promise<void> => {
       .from('project_generation_status')
       .update({ status: 'failed', error_message: err.message })
       .eq('project_id', projectId)
-      .eq('file_name', file_name)
+      .eq('file_name',  file_name)
 
     res.status(500).json({ error: 'Dosya kaydedilemedi.', detail: err.message })
   }
@@ -506,11 +564,11 @@ router.delete('/:id', async (req: Request, res: Response): Promise<void> => {
     if (deleteError) throw deleteError
 
     res.json({
-      deleted:            true,
-      project_id:         projectId,
-      project_name:       (project as any).project_name,
-      local_cleanup_required: true,
-      local_memory_path:  (project as any).local_memory_path,
+      deleted:                 true,
+      project_id:              projectId,
+      project_name:            (project as any).project_name,
+      local_cleanup_required:  true,
+      local_memory_path:       (project as any).local_memory_path,
       // Karar #28: İstemci bu yolu siler
       message: 'Proje Supabase\'den silindi. Lokal memory\'yi de temizle.',
       local_cleanup_instruction:
@@ -571,30 +629,31 @@ router.put('/:id/masterplan', async (req: Request, res: Response): Promise<void>
 
     if (!changed) {
       res.json({
-        updated:          true,
-        content_changed:  false,
-        revision_needed:  false,
-        message:          'Master plan değişmedi — revizyon gerekmez.',
+        updated:         true,
+        content_changed: false,
+        revision_needed: false,
+        message:         'Master plan değişmedi — revizyon gerekmez.',
       })
       return
     }
 
     // İçerik değişti — hangi dosyaların revize edileceğini belirt
     // Karar #29: Claude fark analizini yapar
-    // Bu endpoint fark bilgisini Claude'a iletmek için gerekli veriyi döner
     res.json({
       updated:         true,
       content_changed: true,
       revision_needed: true,
       message:         'Master plan güncellendi. Revizyon gerekiyor.',
       revision_instructions: {
-        priority_files: ['CORE.md', 'AI_AGENT.md'],
+        priority_files:            ['CORE.md', 'AI_AGENT.md'],
         all_files_may_be_affected: true,
         instruction:
           'Claude\'a yeni master planı ver. ' +
           'CORE.md ve AI_AGENT.md değişti mi analiz et. ' +
           'Değiştiyse sadece değişen bölümleri revize et. ' +
           'Etkilenen diğer dosyaları tespit et ve kullanıcıya bildir.',
+        resume_endpoint:
+          `GET /api/project/${projectId}/status?resume=true`,
       },
     })
 
