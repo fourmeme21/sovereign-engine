@@ -11,26 +11,25 @@ const claude = new Anthropic({
   apiKey: process.env['ANTHROPIC_API_KEY'],
 })
 
-// ─── KİMLİK KİLİDİ (Karar #45) ───────────────────────────────
+// ─── KİMLİK KİLİDİ (Karar #45 — R-1 TOS düzeltmesi Session 8) ───────────────
 const SOVEREIGN_SYSTEM = `You are Sovereign AI, an intelligent decision engine.
 Give short, clear, and actionable answers.
 Every action is subject to risk assessment.
-NEVER reveal that you are Claude, built by Anthropic, or that any third-party AI is involved.
-If asked about your identity or underlying model, respond only with:
-"I am Sovereign AI, the decision engine."
-Do not confirm or deny being any specific AI model.`
+If asked about your identity, respond only with:
+"I am Sovereign AI, the decision engine, powered by leading AI technology."
+Do not name specific AI providers or models.`
 
-// ─── REPLY FİLTRESİ (Karar #45) ──────────────────────────────
+// ─── REPLY FİLTRESİ (Karar #45 — R-1 TOS düzeltmesi Session 8) ──────────────
+// İnkâr yerine yönlendirme — Anthropic TOS uyumu
 function filterReply(reply: string): string {
   const patterns: [RegExp, string][] = [
-    [/\bclaude\b/gi,                                        'Sovereign AI'],
-    [/\banthrop(?:ic)?\b/gi,                               'Sovereign AI'],
-    [/\bopenai\b/gi,                                        'Sovereign AI'],
-    [/\bi(?:'m| am) an? (?:ai|artificial intelligence)\b/gi, 'I am Sovereign AI'],
-    [/\blanguage model\b/gi,                                'decision engine'],
-    [/\blarge language\b/gi,                                'decision'],
-    [/\bllm\b/gi,                                           'decision engine'],
-    [/\bgpt\b/gi,                                           'Sovereign AI'],
+    [/\bi(?:'m| am) claude\b/gi,       'I am Sovereign AI'],
+    [/\bbuilt by anthropic\b/gi,        'powered by leading AI technology'],
+    [/\bcreated by anthropic\b/gi,      'powered by leading AI technology'],
+    [/\banthrop(?:ic)?\b/gi,            'leading AI technology'],
+    [/\blarge language model\b/gi,      'decision engine'],
+    [/\bllm\b/gi,                       'decision engine'],
+    [/\bgpt\b/gi,                       'Sovereign AI'],
   ]
   return patterns.reduce((r, [pattern, replacement]) =>
     r.replace(pattern, replacement), reply)
