@@ -25,7 +25,7 @@ import path         from 'path'
 // ---------------------------------------------------------------------------
 
 /** Token eşiği — aşılınca enjeksiyon tetiklenir */
-const INJECTION_TOKEN_THRESHOLD = 80_000
+const INJECTION_TOKEN_THRESHOLD = 120_000
 
 /** Cache TTL: 30 dakika (ms) */
 const CACHE_TTL_MS = 30 * 60 * 1000
