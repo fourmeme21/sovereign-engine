@@ -7,26 +7,25 @@ import { v4 as uuid } from 'uuid'
 import { execSync } from 'child_process'
 import fs from 'fs'
 import path from 'path'
-import { supabase } from './lib/supabase.js'
-import { authMiddleware } from './middleware/authMiddleware.js'
-import { tierGuard } from './middleware/tierGuard.js'
-import memoryRouter from './routes/memoryRouter.js'
-import githubRouter from './routes/githubRouter.js'
-import adminRouter from './routes/adminRouter.js'
-import dodoRouter  from './routes/dodoRouter.js'
-import aiProxy     from './routes/aiProxy.js'
+import { supabase }         from './lib/supabase.js'
+import { authMiddleware }   from './middleware/authMiddleware.js'
+import { tierGuard }        from './middleware/tierGuard.js'
+import memoryRouter         from './routes/memoryRouter.js'
+import githubRouter         from './routes/githubRouter.js'
+import adminRouter          from './routes/adminRouter.js'
+import dodoRouter           from './routes/dodoRouter.js'
+import aiProxy              from './routes/aiProxy.js'
+import projectRouter        from './routes/projectRouter.js'   // ← ADAPTERv1 Session 6
 import jwt from 'jsonwebtoken'
 
 // ─── JWT SECRET ──────────────────────────────────────────────
-// Açık Sorun #1 fix: Secret env'den okunur — binary'e gömülü değil.
-// Railway Variables → JWT_SECRET eklenmeli. Rotation: env'i güncelle + redeploy.
 const JWT_SECRET = process.env['JWT_SECRET']
 if (!JWT_SECRET) {
   console.error('[FATAL] JWT_SECRET env değişkeni tanımlanmamış — sistem başlamıyor.')
   process.exit(1)
 }
 
-export type Verdict = 'PERMIT' | 'DENY' | 'ASK_HUMAN'
+export type Verdict     = 'PERMIT' | 'DENY' | 'ASK_HUMAN'
 export type Criticality = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
 
 export interface Decision {
@@ -39,7 +38,6 @@ export interface WsMessage {
   decisions?: Decision[]; decision?: Decision
 }
 
-// TB-10 fix: Mock veriler kaldırıldı — cold trigger'da gerçek Supabase verisi gelecek
 const decisionStore: Decision[] = []
 
 const MAX_DECISIONS = 200
@@ -59,10 +57,7 @@ interface PatchInput {
   payload?: Record<string, unknown>; session_id?: string; agent?: string; timestamp?: string
 }
 
-
 // ─── JWT TOKEN ÜRETIMI ───────────────────────────────────────
-// Açık Sorun #1 fix: HS256 imzalı gerçek JWT — JWT_SECRET env'den okunur.
-// Payload ARCHITECTURE.md §2.2 ExecutionTokenPayload ile uyumlu.
 function issueToken(patch: PatchInput): string {
   const decisionId = uuid()
   const payload = {
@@ -75,6 +70,7 @@ function issueToken(patch: PatchInput): string {
   }
   return jwt.sign(payload, JWT_SECRET as string, { algorithm: 'HS256', expiresIn: 30 })
 }
+
 function evaluatePatch(patch: PatchInput): { verdict: Verdict; policy: string; reason: string; token: string | null } {
   const IMMUTABLE = ['system.config', 'audit.log', 'policy.kernel']
   const target = patch.target ?? ''
@@ -99,9 +95,9 @@ function evaluatePatch(patch: PatchInput): { verdict: Verdict; policy: string; r
       const parsed = JSON.parse(result)
       return {
         verdict: parsed.verdict ?? 'PERMIT',
-        policy: parsed.policy_id ?? 'POL-007',
-        reason: parsed.reason ?? 'CLI validation passed',
-        token: parsed.execution_token ?? issueToken(patch),
+        policy:  parsed.policy_id ?? 'POL-007',
+        reason:  parsed.reason ?? 'CLI validation passed',
+        token:   parsed.execution_token ?? issueToken(patch),
       }
     }
   } catch (_) {}
@@ -117,9 +113,9 @@ async function mcpProxy(subpath: string, body?: unknown) {
   if (!MCP_URL) return { ok: false, error: 'MCP_NOT_CONFIGURED', hint: 'Set MCP_URL env variable to your local mcp-server ngrok URL' }
   try {
     const res = await fetch(`${MCP_URL}${subpath}`, {
-      method: body ? 'POST' : 'GET',
+      method:  body ? 'POST' : 'GET',
       headers: { 'Content-Type': 'application/json' },
-      body: body ? JSON.stringify(body) : undefined,
+      body:    body ? JSON.stringify(body) : undefined,
     })
     const data = await res.json()
     return { ok: res.ok, ...data }
@@ -145,7 +141,7 @@ app.use(cors({
     if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true)
     callback(new Error(`CORS: izin verilmeyen origin — ${origin}`))
   },
-  methods: ['GET', 'POST', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],   // PUT + DELETE eklendi (projectRouter)
   allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-password'],
 }))
 
@@ -156,7 +152,7 @@ app.use('/api/billing/webhook', express.raw({ type: 'application/json' }), (req,
 })
 
 // ─── Body parser ─────────────────────────────────────────────
-app.use(express.json({ limit: '1mb' }))
+app.use(express.json({ limit: '2mb' }))   // 1mb → 2mb (master plan dosyaları için)
 
 // ─── Rate limiting ───────────────────────────────────────────
 const globalLimiter = rateLimit({
@@ -218,7 +214,7 @@ app.get('/api/session', authMiddleware, (_, res) => {
       { faz: 'FAZ 4', title: 'Execution Gate (Rust)', done: true,  active: false },
       { faz: 'FAZ 5', title: 'Domain Adapter',        done: true,  active: false },
       { faz: 'FAZ 6', title: 'Dashboard',             done: true,  active: true  },
-      { faz: 'FAZ 7', title: 'NotebookLM MCP',        done: false, active: false },
+      { faz: 'FAZ 7', title: 'ADAPTERv1',             done: false, active: true  },
     ],
     issues: [],
     mcp: { configured: !!MCP_URL, url: MCP_URL || null },
@@ -233,18 +229,17 @@ app.post('/api/apply', authMiddleware, tierGuard(), async (req, res) => {
   const start = Date.now()
   const { verdict, policy, reason, token } = evaluatePatch(patch)
   const decision: Decision = {
-    id: `dec-${uuid().replace(/-/g, '').slice(0, 7)}`,
-    action: patch.action ?? 'EXECUTE_ACTION',
+    id:          `dec-${uuid().replace(/-/g, '').slice(0, 7)}`,
+    action:      patch.action ?? 'EXECUTE_ACTION',
     criticality: patch.criticality ?? 'MEDIUM',
     verdict, policy, reason, token,
-    time: new Date().toLocaleTimeString('tr-TR'),
-    latency: `${Date.now() - start}ms`,
+    time:        new Date().toLocaleTimeString('tr-TR'),
+    latency:     `${Date.now() - start}ms`,
   }
   addDecision(decision)
   broadcast({ type: 'decision', decision })
   res.json(decision)
 
-  // +++ Supabase persist (Phase 0 — user_id bazlı) +++
   const userId = (req as any).user?.id
   if (userId) {
     const riskScore = patch.criticality === 'CRITICAL' ? 9
@@ -258,13 +253,7 @@ app.post('/api/apply', authMiddleware, tierGuard(), async (req, res) => {
       policy_verdict:  verdict,
       trace_id:        decision.id,
     }).then(({ error }) => {
-      if (error) {
-        console.error('[apply] Supabase insert error:', error.message)
-        broadcast({ type: 'decision', decision: {
-          ...decision,
-          reason: `[SYNC_ERROR] ${decision.reason} — DB yazılamadı: ${error.message}`,
-        }})
-      }
+      if (error) console.error('[apply] Supabase insert error:', error.message)
     })
   }
 })
@@ -288,11 +277,12 @@ app.post('/mcp/query', authMiddleware, async (req, res) => {
 })
 
 // ─── Router'lar ───────────────────────────────────────────────
-app.use('/memory',      authMiddleware, tierGuard(), memoryRouter)
-app.use('/github',      authMiddleware, githubRouter)
-app.use('/admin',       adminRouter)
-app.use('/api/billing', dodoRouter)
-app.use('/api/ai',      authMiddleware, aiProxy)
+app.use('/memory',       authMiddleware, tierGuard(), memoryRouter)
+app.use('/github',       authMiddleware, githubRouter)
+app.use('/admin',        adminRouter)
+app.use('/api/billing',  dodoRouter)
+app.use('/api/ai',       authMiddleware, aiProxy)
+app.use('/api/project',  projectRouter)                            // ← ADAPTERv1 Session 6
 
 // ─── WebSocket ───────────────────────────────────────────────
 const server = http.createServer(app)
@@ -317,15 +307,14 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`Origins: ${ALLOWED_ORIGINS.join(', ')}`)
   console.log(`MCP_URL: ${MCP_URL || 'not configured'}`)
 })
-// ─── RAILWAY KEEP-ALIVE (Self-Ping) ──────────────────────────
-// Railway 30 dk boşlukta uyur. 10 dakikada bir kendini pingleyerek aktif tutuyoruz.
+
+// ─── RAILWAY KEEP-ALIVE ───────────────────────────────────────
 setInterval(() => {
-  const url = `http://localhost:${PORT}/health`;
+  const url = `http://localhost:${PORT}/health`
   http.get(url, (res) => {
-    if (res.statusCode === 200) {
-      console.log('[Keep-Alive] Ping başarılı:', new Date().toLocaleTimeString());
-    }
+    if (res.statusCode === 200)
+      console.log('[Keep-Alive] Ping başarılı:', new Date().toLocaleTimeString())
   }).on('error', (err) => {
-    console.error('[Keep-Alive] Ping hatası:', err.message);
-  });
-}, 10 * 60 * 1000); // 10 dakika
+    console.error('[Keep-Alive] Ping hatası:', err.message)
+  })
+}, 10 * 60 * 1000)
