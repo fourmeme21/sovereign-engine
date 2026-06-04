@@ -297,6 +297,7 @@ router.post('/chat', async (req, res) => {
 // ─── POST /api/ai/apply ──────────────────────────────────────
 //
 // ADAPTERv1 Session 4 — adapter.execute() bağlantısı
+// FIX-1 (Session 9): validateContract() await eklendi — async interface uyumu
 //
 // Akış:
 //   1. decision objesi al
@@ -426,7 +427,7 @@ router.post('/apply', async (req, res) => {
       const AdapterClass = (sandboxExports.default ??
         Object.values(sandboxExports)[0]) as new () => {
           execute: (action: string, params: Record<string, unknown>, ctx: ExecutionContext) => Promise<ActionResult>
-          validateContract: () => boolean
+          validateContract: () => Promise<boolean>  // FIX-1: async olarak düzeltildi
         }
 
       if (typeof AdapterClass !== 'function') {
@@ -435,9 +436,9 @@ router.post('/apply', async (req, res) => {
 
       const adapterInst = new AdapterClass()
 
-      // validateContract() kontrolü — ARCHITECTURE.md Kural 11
+      // FIX-1 (Session 9): validateContract() async — await eklendi
       if (typeof adapterInst.validateContract === 'function') {
-        const valid = adapterInst.validateContract()
+        const valid = await adapterInst.validateContract()
         if (!valid) {
           throw new Error('[R-7] validateContract() false döndü — adapter yüklenemiyor.')
         }
