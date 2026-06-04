@@ -16,6 +16,7 @@ import adminRouter          from './routes/adminRouter.js'
 import dodoRouter           from './routes/dodoRouter.js'
 import aiProxy              from './routes/aiProxy.js'
 import projectRouter        from './routes/projectRouter.js'   // ← ADAPTERv1 Session 6
+import { preloadProjectCache } from './lib/contextInjector.js'        // ← ADAPTERv1 Session 6
 import jwt from 'jsonwebtoken'
 
 // ─── JWT SECRET ──────────────────────────────────────────────
@@ -302,10 +303,12 @@ wss.on('connection', (ws) => {
 })
 
 const PORT = parseInt(process.env['PORT'] ?? '8080', 10)
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, '0.0.0.0', async () => {
   console.log(`Sovereign Engine :${PORT}`)
   console.log(`Origins: ${ALLOWED_ORIGINS.join(', ')}`)
   console.log(`MCP_URL: ${MCP_URL || 'not configured'}`)
+  // ADAPTERv1 Session 6 — Proje cache'lerini ön yükle
+  await preloadProjectCache()
 })
 
 // ─── RAILWAY KEEP-ALIVE ───────────────────────────────────────
