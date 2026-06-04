@@ -1,7 +1,7 @@
 // engine/src/routes/userRouter.ts
 // R-2 — GDPR veri silme
 // DELETE /api/user/data
-// ADAPTERv1 Session 8
+// ADAPTERv1 Session 8 — FIX: user_profiles .eq('id', userId)
 
 import { Router, Request, Response } from 'express'
 import { authMiddleware } from '../middleware/authMiddleware.js'
@@ -99,10 +99,11 @@ router.delete(
     if (e7) errors.push(`user_projects: ${e7.message}`)
 
     // --- 8. user_profiles ---
+    // FIX: user_profiles PK is 'id', not 'user_id'
     const { error: e8 } = await supabase
       .from('user_profiles')
       .delete()
-      .eq('user_id', userId)
+      .eq('id', userId)  // ✅ DOĞRU — şemada user_id yok, PK = id
     if (e8) errors.push(`user_profiles: ${e8.message}`)
 
     // --- Sonuç ---
