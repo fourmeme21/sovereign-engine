@@ -3,6 +3,7 @@ import Anthropic from '@anthropic-ai/sdk'
 import { supabase } from '../lib/supabase.js'
 import { loadRegistry, matchCategory } from '../lib/adapterRegistry.js'
 import type { ActionResult, ExecutionContext } from '../../../domain/template/adapter.js'
+import { checkAndInject }                                from '../lib/contextInjector.js'
 
 const router = express.Router()
 
@@ -53,12 +54,23 @@ function scoreChatRisk(_userMessage: string, _assistantReply: string): ChatRiskR
 }
 
 // ─── POST /api/ai/chat ────────────────────────────────────────
+//
+// ADAPTERv1 Session 6 — Bağlam enjeksiyonu eklendi
+// Her çağrıda token sayacı güncellenir.
+// 80.000 token eşiği aşılınca CORE + AI_AGENT + session_index enjekte edilir.
 router.post('/chat', async (req, res) => {
-  const { messages, max_tokens = 1024 } = req.body
+  const {
+    messages,
+    max_tokens        = 1024,
+    project_id        = null,    // Aktif proje (yoksa enjeksiyon yapılmaz)
+    local_memory_path = null,    // hot.json konumu (Tauri'den gelir)
+  } = req.body
 
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: 'messages array zorunlu' })
   }
+
+  const userId = (req as any).user?.id ?? 'anonymous'
 
   try {
     const response = await claude.messages.create({
@@ -71,19 +83,33 @@ router.post('/chat', async (req, res) => {
     const rawReply = (response.content[0] as Anthropic.TextBlock)?.text ?? ''
     const reply    = filterReply(rawReply)
 
-    const lastUserMsg = [...messages].reverse().find(m => m.role === 'user')
+    const lastUserMsg = [...messages].reverse().find((m: any) => m.role === 'user')
     const userText    = typeof lastUserMsg?.content === 'string'
       ? lastUserMsg.content
       : ''
 
     const risk = scoreChatRisk(userText, reply)
 
+    // ── Bağlam Enjeksiyonu ────────────────────────────────────────────────
+    // Token kullanımını kaydet, eşik aşıldıysa enjeksiyon içeriği al.
+    // Kullanıcı bunu görmez — bir sonraki API çağrısında system prompt'a eklenir.
+    const injection = await checkAndInject(
+      userId,
+      project_id,
+      local_memory_path,
+      response.usage.input_tokens,
+      response.usage.output_tokens,
+    )
+
     res.json({
       reply,
-      risk:    risk.score,
-      verdict: risk.verdict,
-      policy:  risk.policy,
-      reason:  risk.reason,
+      risk:             risk.score,
+      verdict:          risk.verdict,
+      policy:           risk.policy,
+      reason:           risk.reason,
+      // İstemci bir sonraki mesajda system_suffix'i system prompt'a ekler
+      context_injected: injection.injected,
+      system_suffix:    injection.injected ? injection.system_suffix : null,
     })
 
   } catch (err: any) {
