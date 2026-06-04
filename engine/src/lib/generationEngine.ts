@@ -1,7 +1,7 @@
 /**
  * engine/src/lib/generationEngine.ts
  *
- * Generation Engine — ADAPTERv1 Session 7
+ * Generation Engine — ADAPTERv1 Session 7 (v1.1)
  *
  * Görev:
  *   Master plan + evrensel şablondan proje dökümanlarını Claude'a ürettirir.
@@ -9,19 +9,25 @@
  *
  * Mimari (session_index.md → GENERATION ENGINE MİMARİSİ):
  *   1. /api/project/create → projectRouter → runGeneration() çağrılır (arka plan)
- *   2. ~3000 token kapasitesi → dolunca yeni oturum + bağlam enjeksiyonu
+ *   2. ~20k token kapasitesi → dolunca yeni oturum + gerçek bağlam özeti enjeksiyonu
  *   3. Üretim sırası: CORE.md → AI_AGENT.md → ARCHITECTURE.md → ... → projeye özel
  *   4. Her dosya sonrası: project_generation_status güncellenir (Karar #26)
  *   5. CORE + AI_AGENT → user_projects.core_doc / ai_agent_doc (Karar #23)
  *   6. Tüm dosyalar tamam → gen_status = 'completed'
  *
+ * v1.1 değişiklikleri (ChatGPT denetim raporu):
+ *   KRİTİK-1: Gerçek context zinciri — her dosya sonrası Claude'a özet çıkartılır
+ *   KRİTİK-4: Best Effort Mode — tek dosya hatasında süreç durmaz, devam eder
+ *   KRİTİK-6: SESSION_TOKEN_CAPACITY 3k → 20k (Sonnet 4 context limiti 200k)
+ *   KRİTİK-9: Cost tracking — her dosya için input/output token + maliyet loglanır
+ *
  * Kararlar:
  *   #19: "Adapter" = projeye özel eksiksiz yürütme dokümantasyonu
  *   #20: Evrensel şablon Seçenek B — dolu referans, Claude projeye özel yazar
  *   #21: Master plan formatı serbest
- *   #23: CORE + AI_AGENT → Supabase, şifreli (plain text şimdilik — TODO: AES-256)
+ *   #23: CORE + AI_AGENT → Supabase (plain text şimdilik — TODO: AES-256)
  *   #26: Generation recovery — her dosya sonrası durum kaydedilir
- *   #31: Akıllı paketleme — ~3000 token kapasitesi, dolunca yeni oturum
+ *   #31: Akıllı paketleme — 20k token kapasitesi, dolunca yeni oturum
  */
 
 import Anthropic from '@anthropic-ai/sdk'
@@ -31,17 +37,33 @@ import { supabase } from './supabase.js'
 // SABİTLER
 // ---------------------------------------------------------------------------
 
-/** Her Claude oturumuna paketlenecek yaklaşık token kapasitesi */
-const SESSION_TOKEN_CAPACITY = 3_000
+/**
+ * Her Claude oturumuna paketlenecek yaklaşık token kapasitesi.
+ * KRİTİK-6: 3k → 20k. Sonnet 4 context limiti 200k — gereksiz session bölünmesi önlendi.
+ * contextInjector.ts → INJECTION_TOKEN_THRESHOLD (120k) ile karıştırılmamalı — o chat içindir.
+ */
+const SESSION_TOKEN_CAPACITY = 20_000
 
-/** Ortalama karakter başına token tahmini (Türkçe/İngilizce karışık) */
-const CHARS_PER_TOKEN = 3.5
+/**
+ * Ortalama karakter başına token tahmini.
+ * Türkçe/İngilizce karışık metin için 4.0 daha güvenli alt sınır.
+ * KRİTİK-5: Gerçek tokenizer şimdilik mevcut değil — sonraki sprintte ele alınır.
+ */
+const CHARS_PER_TOKEN = 4.0
 
 /** Claude modeli — aiProxy.ts ile tutarlı */
 const MODEL = 'claude-sonnet-4-20250514'
 
 /** Maksimum tekrar denemesi — tek dosya üretiminde */
 const MAX_RETRIES = 2
+
+/**
+ * Anthropic fiyatlandırması (Sonnet 4, USD / 1M token).
+ * KRİTİK-9: Cost tracking için kullanılır.
+ * Fiyatlar değişirse buradan güncellenir.
+ */
+const PRICE_INPUT_PER_M  = 3.0   // $3.00 / 1M input token
+const PRICE_OUTPUT_PER_M = 15.0  // $15.00 / 1M output token
 
 // ---------------------------------------------------------------------------
 // TİPLER
@@ -54,38 +76,50 @@ export interface GenerationOptions {
   masterPlan:      string
   /** Önceden tamamlanmış dosya isimleri — recovery için */
   completedFiles?: string[]
+  /**
+   * KRİTİK-4: Best Effort Mode.
+   * true  → dosya hatasında devam et, sonunda partial_success raporu döndür
+   * false → (strict) ilk hata anında dur (varsayılan: true)
+   */
+  bestEffort?: boolean
 }
 
 interface FileSpec {
   fileName:      string
   fileOrder:     number
   storageTarget: 'supabase' | 'local_warm' | 'local_hot'
-  /** System prompt'taki bu dosyayla ilgili talimat */
   instruction:   string
 }
 
 interface GenerationSession {
-  /** Bu oturumda üretilecek dosyalar */
-  files:         FileSpec[]
-  /** Önceki oturumlarda üretilen dosyaların özeti — bağlam zinciri için */
-  priorContext:  string
+  files:        FileSpec[]
+  priorContext: string
+}
+
+/** KRİTİK-9: Tek dosya için maliyet kaydı */
+interface FileCost {
+  fileName:     string
+  inputTokens:  number
+  outputTokens: number
+  costUsd:      number
 }
 
 export interface GenerationResult {
-  success:       boolean
-  completedFiles: string[]
-  failedFile?:   string
-  error?:        string
+  success:         boolean
+  /** 'completed' | 'partial_success' | 'failed' — KRİTİK-4 */
+  status:          'completed' | 'partial_success' | 'failed'
+  completedFiles:  string[]
+  failedFiles:     string[]   // KRİTİK-4: artık dizi
+  /** KRİTİK-9: toplam maliyet */
+  totalCostUsd:    number
+  fileCosts:       FileCost[]
+  error?:          string
 }
 
 // ---------------------------------------------------------------------------
-// EVRENSEl DOSYA PLANI
+// EVRENSEL DOSYA PLANI
 // ---------------------------------------------------------------------------
 
-/**
- * Varsayılan dosya üretim planı.
- * Karar #31: Projeye özel ek dosyaları Claude kendisi belirler.
- */
 const DEFAULT_FILE_PLAN: Omit<FileSpec, 'instruction'>[] = [
   { fileName: 'CORE.md',             fileOrder: 1,  storageTarget: 'supabase'   },
   { fileName: 'AI_AGENT.md',         fileOrder: 2,  storageTarget: 'supabase'   },
@@ -100,11 +134,18 @@ const DEFAULT_FILE_PLAN: Omit<FileSpec, 'instruction'>[] = [
 ]
 
 // ---------------------------------------------------------------------------
-// YARDIMCI: Token tahmini
+// YARDIMCI: Token ve maliyet tahmini
 // ---------------------------------------------------------------------------
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / CHARS_PER_TOKEN)
+}
+
+function calcCost(inputTokens: number, outputTokens: number): number {
+  return (
+    (inputTokens  / 1_000_000) * PRICE_INPUT_PER_M +
+    (outputTokens / 1_000_000) * PRICE_OUTPUT_PER_M
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -234,30 +275,65 @@ Boş başlangıç session log dosyası.
 }
 
 // ---------------------------------------------------------------------------
+// KRİTİK-1: Dosya özeti çıkar
+//
+// Her dosya üretildikten sonra Claude'a 3-5 maddelik özet çıkartılır.
+// Bu özet sonraki oturumun priorContext'ine eklenir — gerçek bağlam zinciri.
+// ---------------------------------------------------------------------------
+
+async function extractFileSummary(
+  claude:    Anthropic,
+  fileName:  string,
+  content:   string,
+): Promise<string> {
+  try {
+    const response = await claude.messages.create({
+      model:      MODEL,
+      max_tokens: 300,
+      system:     'Sen bir teknik dokümantasyon analistisin. Kısa ve net ol.',
+      messages: [{
+        role:    'user',
+        content: `Aşağıdaki "${fileName}" dosyasından 3-5 maddelik özet çıkar.
+Her madde tek cümle olsun. Sadece maddeleri ver — başka açıklama ekleme.
+Odak: mimari kararlar, veri modelleri, servisler, kurallar, kritik kısıtlar.
+
+İçerik:
+${content.slice(0, 3000)}${content.length > 3000 ? '\n[...truncated...]' : ''}`,
+      }],
+    })
+
+    const summary = (response.content[0] as Anthropic.TextBlock)?.text ?? ''
+    return `### ${fileName}\n${summary}`
+
+  } catch {
+    // Özet başarısız olsa da üretim devam eder
+    return `### ${fileName}\n(özet çıkarılamadı)`
+  }
+}
+
+// ---------------------------------------------------------------------------
 // YARDIMCI: Dosyaları oturuma paketle
 // ---------------------------------------------------------------------------
 
 /**
- * Dosyaları ~3000 token kapasiteli oturumlara böler.
- * Her oturumda sistem promptu + master plan sabit maliyet olarak sayılır.
- *
- * Karar #31: ~3000 token kapasitesi, dolunca yeni oturum + bağlam enjeksiyonu
+ * KRİTİK-6: SESSION_TOKEN_CAPACITY 3k → 20k.
+ * Sonnet 4 context 200k — gereksiz session bölünmesi önlendi.
+ * 10 dosyanın tamamı büyük olasılıkla tek oturuma sığar.
  */
 function packIntoSessions(
-  files:       FileSpec[],
-  masterPlan:  string,
+  files:      FileSpec[],
+  masterPlan: string,
 ): GenerationSession[] {
   const sessions: GenerationSession[] = []
-  const baseCost = estimateTokens(masterPlan) + 500 // sistem promptu sabit maliyeti
+  const baseCost = estimateTokens(masterPlan) + 500
 
   let current: FileSpec[] = []
   let currentCost = baseCost
 
   for (const file of files) {
-    const fileCost = estimateTokens(file.instruction) + 200 // dosya başlığı ve format yönergesi
+    const fileCost = estimateTokens(file.instruction) + 200
 
     if (current.length > 0 && currentCost + fileCost > SESSION_TOKEN_CAPACITY) {
-      // Kapasite doldu — yeni oturum aç
       sessions.push({ files: current, priorContext: '' })
       current     = []
       currentCost = baseCost
@@ -279,17 +355,17 @@ function packIntoSessions(
 // ---------------------------------------------------------------------------
 
 function buildSystemPrompt(
-  projectName:  string,
-  masterPlan:   string,
-  priorContext: string,
+  projectName:    string,
+  masterPlan:     string,
+  priorContext:   string,
   isFirstSession: boolean,
 ): string {
   const intro = isFirstSession
     ? `Sen "${projectName}" projesinin metodoloji dokümantasyon motorusun.`
-    : `Sen "${projectName}" projesinin metodoloji dokümantasyon motorusun. Daha önce üretilen dosyalar aşağıda özetlenmiştir.`
+    : `Sen "${projectName}" projesinin metodoloji dokümantasyon motorusun. Önceki oturumda üretilen dosyaların özetleri aşağıdadır — tutarlılık için bunlara bağlı kal.`
 
   const priorSection = priorContext
-    ? `\n\n## Önceki Oturumda Üretilen Dosyalar\n${priorContext}`
+    ? `\n\n## Önceki Oturumda Üretilen Dosyaların Özetleri\n${priorContext}\n\n> Bu özetlere dayanarak yeni dosyaları üret. Çelişki yaratma.`
     : ''
 
   return `${intro}
@@ -308,8 +384,7 @@ ${priorSection}
 3. Truncated çıktı yasak — her dosya tam ve eksiksiz olmalı
 4. Placeholder ("örnek", "TODO", "[buraya ekle]") kullanma — gerçek içerik üret
 5. Projeye özgü ol — jenerik şablon değil, bu projeye özel içerik
-6. Türkçe ve İngilizce karışık kullanım projenin diline göre ayarla
-   (master plan hangi dildeyse dosyalar da o dilde üretilir)`.trim()
+6. Master plan hangi dildeyse dosyalar da o dilde üretilir`.trim()
 }
 
 // ---------------------------------------------------------------------------
@@ -317,28 +392,22 @@ ${priorSection}
 // ---------------------------------------------------------------------------
 
 function extractFileContent(response: string, fileName: string): string | null {
-  // <FILE name="DOSYA_ADI"> ... </FILE> formatını ara
   const pattern = new RegExp(
     `<FILE\\s+name=["']?${fileName.replace('.', '\\.')}["']?>([\\s\\S]*?)</FILE>`,
     'i'
   )
   const match = response.match(pattern)
 
-  if (match) {
-    return match[1].trim()
-  }
+  if (match) return match[1].trim()
 
-  // Fallback: Tüm yanıt tek dosya içinse direkt kullan
-  // (Claude bazen etiketsiz verir — tek dosya üretiminde güvenli)
-  if (response.length > 100) {
-    return response.trim()
-  }
+  // Fallback: tek dosya üretiminde etiketsiz yanıt
+  if (response.length > 100) return response.trim()
 
   return null
 }
 
 // ---------------------------------------------------------------------------
-// YARDIMCI: Supabase'de dosya durumu güncelle
+// YARDIMCI: Supabase dosya durumu güncelle
 // ---------------------------------------------------------------------------
 
 async function markFileStatus(
@@ -359,7 +428,7 @@ async function markFileStatus(
 }
 
 // ---------------------------------------------------------------------------
-// YARDIMCI: Dosyayı Supabase'e kaydet
+// YARDIMCI: Supabase'e dosya kaydet
 // ---------------------------------------------------------------------------
 
 async function saveToSupabase(
@@ -368,7 +437,6 @@ async function saveToSupabase(
   content:   string,
 ): Promise<void> {
   if (fileName === 'CORE.md') {
-    // Karar #23: core_doc alanına yaz (TODO: AES-256 şifreleme ekle)
     const { error } = await supabase
       .from('user_projects')
       .update({ core_doc: content, gen_status: 'in_progress' })
@@ -378,7 +446,6 @@ async function saveToSupabase(
   }
 
   if (fileName === 'AI_AGENT.md') {
-    // Karar #23: ai_agent_doc alanına yaz
     const { error } = await supabase
       .from('user_projects')
       .update({ ai_agent_doc: content, gen_status: 'in_progress' })
@@ -386,15 +453,17 @@ async function saveToSupabase(
     if (error) throw new Error(`ai_agent_doc yazılamadı: ${error.message}`)
     return
   }
-
-  // Diğer supabase hedefli dosyalar — şimdilik sadece CORE + AI_AGENT Supabase'e gider
-  // local_warm ve local_hot dosyalar istemci tarafında kaydedilir
-  // Bu fonksiyon sadece storageTarget='supabase' dosyalar için çağrılır
 }
 
 // ---------------------------------------------------------------------------
 // TEK DOSYA ÜRETİMİ
 // ---------------------------------------------------------------------------
+
+interface SingleFileResult {
+  content:      string
+  inputTokens:  number
+  outputTokens: number
+}
 
 async function generateSingleFile(
   claude:       Anthropic,
@@ -402,7 +471,7 @@ async function generateSingleFile(
   file:         FileSpec,
   systemPrompt: string,
   retryCount:   number = 0,
-): Promise<string> {
+): Promise<SingleFileResult> {
   const userMessage = `Şimdi sadece "${file.fileName}" dosyasını üret.
 
 ${file.instruction}
@@ -414,7 +483,6 @@ Yanıtını şu formatta ver:
 
 Sadece bu dosyayı üret — başka açıklama ekleme.`
 
-  // started_at kaydet
   await supabase
     .from('project_generation_status')
     .update({ started_at: new Date().toISOString(), status: 'pending' })
@@ -432,10 +500,8 @@ Sadece bu dosyayı üret — başka açıklama ekleme.`
     })
   } catch (err: any) {
     if (retryCount < MAX_RETRIES) {
-      console.warn(
-        `[generationEngine] Claude API hatası, tekrar deneniyor (${retryCount + 1}/${MAX_RETRIES}): ${err.message}`
-      )
-      await new Promise(r => setTimeout(r, 2000 * (retryCount + 1))) // exponential backoff
+      console.warn(`[generationEngine] API hatası, retry ${retryCount + 1}/${MAX_RETRIES}: ${err.message}`)
+      await new Promise(r => setTimeout(r, 2000 * (retryCount + 1)))
       return generateSingleFile(claude, projectId, file, systemPrompt, retryCount + 1)
     }
     throw err
@@ -446,79 +512,76 @@ Sadece bu dosyayı üret — başka açıklama ekleme.`
 
   if (!content) {
     if (retryCount < MAX_RETRIES) {
-      console.warn(
-        `[generationEngine] "${file.fileName}" içeriği çıkarılamadı, tekrar deneniyor...`
-      )
+      console.warn(`[generationEngine] "${file.fileName}" içerik çıkarılamadı, retry...`)
       return generateSingleFile(claude, projectId, file, systemPrompt, retryCount + 1)
     }
     throw new Error(`"${file.fileName}" için geçerli içerik üretilemedi.`)
   }
 
-  return content
+  return {
+    content,
+    inputTokens:  response.usage.input_tokens,
+    outputTokens: response.usage.output_tokens,
+  }
 }
 
 // ---------------------------------------------------------------------------
 // ANA FONKSİYON: runGeneration
 // ---------------------------------------------------------------------------
 
-/**
- * Proje oluşturulunca arka planda çağrılır.
- * /api/project/create → setImmediate(() => runGeneration(...))
- *
- * Recovery: completedFiles listesi verilirse tamamlanmış dosyalar atlanır.
- */
 export async function runGeneration(opts: GenerationOptions): Promise<GenerationResult> {
-  const { projectId, userId, projectName, masterPlan, completedFiles = [] } = opts
+  const {
+    projectId,
+    userId,
+    projectName,
+    masterPlan,
+    completedFiles = [],
+    bestEffort = true,   // KRİTİK-4: varsayılan Best Effort
+  } = opts
 
-  console.log(`[generationEngine] Başladı — proje: ${projectId} (${projectName})`)
+  console.log(`[generationEngine] Başladı — ${projectId} (${projectName}) | mode: ${bestEffort ? 'best-effort' : 'strict'}`)
 
-  const claude = new Anthropic({
-    apiKey: process.env.ANTHROPIC_API_KEY!,
-  })
+  const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! })
 
-  // Üretilecek dosyaları hazırla (talimatlarla birlikte)
   const allFiles: FileSpec[] = DEFAULT_FILE_PLAN.map(f => ({
     ...f,
     instruction: getFileInstruction(f.fileName),
   }))
 
-  // Recovery: tamamlanmış dosyaları atla
   const pendingFiles = allFiles.filter(f => !completedFiles.includes(f.fileName))
 
   if (pendingFiles.length === 0) {
     console.log(`[generationEngine] Tüm dosyalar zaten tamamlanmış — ${projectId}`)
-    return { success: true, completedFiles }
+    return {
+      success:        true,
+      status:         'completed',
+      completedFiles,
+      failedFiles:    [],
+      totalCostUsd:   0,
+      fileCosts:      [],
+    }
   }
 
-  console.log(
-    `[generationEngine] ${pendingFiles.length} dosya üretilecek ` +
-    `(${completedFiles.length} zaten tamamlandı)`
-  )
+  console.log(`[generationEngine] ${pendingFiles.length} dosya üretilecek (${completedFiles.length} atlandı)`)
 
-  // gen_status = 'in_progress'
   await supabase
     .from('user_projects')
     .update({ gen_status: 'in_progress' })
     .eq('id', projectId)
 
-  // Dosyaları oturumlara paketle (Karar #31)
   const sessions = packIntoSessions(pendingFiles, masterPlan)
-
   console.log(`[generationEngine] ${sessions.length} oturum planlandı`)
 
   const successFiles: string[] = [...completedFiles]
-  let priorContext = ''
+  const failedFiles:  string[] = []                   // KRİTİK-4
+  const fileCosts:    FileCost[] = []                 // KRİTİK-9
+  let   totalCostUsd = 0
+  let   priorContext = ''                             // KRİTİK-1: bağlam zinciri
 
-  // ── Oturum döngüsü ──────────────────────────────────────────────────────
+  // ── Oturum döngüsü ────────────────────────────────────────────────────────
   for (let si = 0; si < sessions.length; si++) {
-    const session = sessions[si]
+    const session       = sessions[si]
     const isFirstSession = si === 0 && completedFiles.length === 0
-
-    // Oturumlar arası bağlam enjeksiyonu (Karar #31)
-    if (si > 0) {
-      priorContext = `Tamamlanan dosyalar: ${successFiles.join(', ')}\n` +
-        `Bu oturumda üretilecekler: ${session.files.map(f => f.fileName).join(', ')}`
-    }
 
     const systemPrompt = buildSystemPrompt(
       projectName,
@@ -537,24 +600,40 @@ export async function runGeneration(opts: GenerationOptions): Promise<Generation
       try {
         console.log(`[generationEngine] Üretiliyor: ${file.fileName}`)
 
-        const content = await generateSingleFile(claude, projectId, file, systemPrompt)
+        const result = await generateSingleFile(claude, projectId, file, systemPrompt)
+
+        // KRİTİK-9: Maliyet kaydet
+        const costUsd = calcCost(result.inputTokens, result.outputTokens)
+        totalCostUsd += costUsd
+        fileCosts.push({
+          fileName:     file.fileName,
+          inputTokens:  result.inputTokens,
+          outputTokens: result.outputTokens,
+          costUsd,
+        })
+        console.log(
+          `[generationEngine] 💰 ${file.fileName}: ` +
+          `in=${result.inputTokens} out=${result.outputTokens} cost=$${costUsd.toFixed(4)}`
+        )
 
         // Supabase hedefli dosyaları kaydet
         if (file.storageTarget === 'supabase') {
-          await saveToSupabase(projectId, file.fileName, content)
+          await saveToSupabase(projectId, file.fileName, result.content)
         }
 
-        // Dosya durumu: completed (Karar #26)
+        // Dosya durumu: completed
         await markFileStatus(projectId, file.fileName, 'completed')
-
         successFiles.push(file.fileName)
 
-        // gen_status güncelle: hepsi bitti mi?
-        const allDone = DEFAULT_FILE_PLAN.every(f =>
+        // KRİTİK-1: Bu dosyanın özetini çıkar — sonraki oturum için bağlam zinciri
+        const summary = await extractFileSummary(claude, file.fileName, result.content)
+        priorContext += (priorContext ? '\n\n' : '') + summary
+
+        // Tüm default dosyalar bitti mi?
+        const allDefaultDone = DEFAULT_FILE_PLAN.every(f =>
           successFiles.includes(f.fileName)
         )
-
-        if (allDone) {
+        if (allDefaultDone) {
           await supabase
             .from('user_projects')
             .update({ gen_status: 'completed' })
@@ -566,35 +645,69 @@ export async function runGeneration(opts: GenerationOptions): Promise<Generation
       } catch (err: any) {
         console.error(`[generationEngine] ❌ ${file.fileName}: ${err.message}`)
 
-        // Dosyayı failed olarak işaretle — diğerleri devam eder
         await markFileStatus(projectId, file.fileName, 'failed', err.message)
+        failedFiles.push(file.fileName)  // KRİTİK-4: diziye ekle
 
-        // gen_status = 'failed' (tek dosya başarısız olsa bile)
-        await supabase
-          .from('user_projects')
-          .update({ gen_status: 'failed' })
-          .eq('id', projectId)
+        if (!bestEffort) {
+          // Strict mode: ilk hata anında dur
+          await supabase
+            .from('user_projects')
+            .update({ gen_status: 'failed' })
+            .eq('id', projectId)
 
-        return {
-          success:        false,
-          completedFiles: successFiles,
-          failedFile:     file.fileName,
-          error:          err.message,
+          return {
+            success:        false,
+            status:         'failed',
+            completedFiles: successFiles,
+            failedFiles,
+            totalCostUsd,
+            fileCosts,
+            error:          err.message,
+          }
         }
+
+        // Best Effort mode: hata logla, sonraki dosyaya devam et
+        console.warn(`[generationEngine] Best Effort: "${file.fileName}" atlandı, devam ediliyor...`)
       }
     }
 
-    // Oturumlar arası kısa bekleme — rate limit koruması
+    // Oturumlar arası bekleme — rate limit koruması
     if (si < sessions.length - 1) {
       await new Promise(r => setTimeout(r, 500))
     }
   }
 
-  console.log(`[generationEngine] ✅ Tamamlandı — ${successFiles.length} dosya üretildi`)
+  // ── Sonuç ─────────────────────────────────────────────────────────────────
+
+  // KRİTİK-4: partial_success durumu
+  const hasFailures = failedFiles.length > 0
+  const finalStatus: GenerationResult['status'] = hasFailures
+    ? (successFiles.length > completedFiles.length ? 'partial_success' : 'failed')
+    : 'completed'
+
+  if (hasFailures) {
+    await supabase
+      .from('user_projects')
+      .update({ gen_status: finalStatus === 'partial_success' ? 'completed' : 'failed' })
+      .eq('id', projectId)
+  }
+
+  console.log(
+    `[generationEngine] ${finalStatus === 'completed' ? '✅' : '⚠️'} Bitti — ` +
+    `${successFiles.length} başarılı / ${failedFiles.length} başarısız | ` +
+    `toplam maliyet: $${totalCostUsd.toFixed(4)}`
+  )
 
   return {
-    success:        true,
+    success:        finalStatus !== 'failed',
+    status:         finalStatus,
     completedFiles: successFiles,
+    failedFiles,
+    totalCostUsd,
+    fileCosts,
+    error:          hasFailures
+      ? `${failedFiles.length} dosya başarısız: ${failedFiles.join(', ')}`
+      : undefined,
   }
 }
 
@@ -602,17 +715,12 @@ export async function runGeneration(opts: GenerationOptions): Promise<Generation
 // RECOVERY: Yarım kalan üretimi devam ettir
 // ---------------------------------------------------------------------------
 
-/**
- * /api/project/:id/status endpoint'i üzerinden tetiklenebilir.
- * Tamamlanan dosyaları Supabase'den okur, kaldığı yerden devam eder.
- */
 export async function resumeGeneration(
   projectId:   string,
   userId:      string,
   projectName: string,
   masterPlan:  string,
 ): Promise<GenerationResult> {
-  // Tamamlanan dosyaları çek
   const { data: statusRows } = await supabase
     .from('project_generation_status')
     .select('file_name, status')
@@ -622,12 +730,12 @@ export async function resumeGeneration(
     .filter(r => r.status === 'completed')
     .map(r => r.file_name as string)
 
-  // Failed dosyayı pending'e geri al — yeniden denenecek
+  // Failed dosyaları pending'e geri al — yeniden denenecek
   await supabase
     .from('project_generation_status')
     .update({ status: 'pending', error_message: null })
-    .eq('project_id',  projectId)
-    .eq('status',      'failed')
+    .eq('project_id', projectId)
+    .eq('status',     'failed')
 
   console.log(`[generationEngine] Recovery başladı — ${completed.length} dosya atlanıyor`)
 
@@ -637,5 +745,6 @@ export async function resumeGeneration(
     projectName,
     masterPlan,
     completedFiles: completed,
+    bestEffort:     true,
   })
 }
