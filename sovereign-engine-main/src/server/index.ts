@@ -16,6 +16,7 @@ import adminRouter          from './routes/adminRouter.js'
 import dodoRouter           from './routes/dodoRouter.js'
 import aiProxy              from './routes/aiProxy.js'
 import projectRouter        from './routes/projectRouter.js'   // ← ADAPTERv1 Session 6
+import userRouter           from './routes/userRouter.js'      // ← ADAPTERv1 Session 8 R-2
 import { preloadProjectCache } from './lib/contextInjector.js'        // ← ADAPTERv1 Session 6
 import jwt from 'jsonwebtoken'
 
@@ -142,7 +143,7 @@ app.use(cors({
     if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true)
     callback(new Error(`CORS: izin verilmeyen origin — ${origin}`))
   },
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],   // PUT + DELETE eklendi (projectRouter)
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-password'],
 }))
 
@@ -153,7 +154,7 @@ app.use('/api/billing/webhook', express.raw({ type: 'application/json' }), (req,
 })
 
 // ─── Body parser ─────────────────────────────────────────────
-app.use(express.json({ limit: '2mb' }))   // 1mb → 2mb (master plan dosyaları için)
+app.use(express.json({ limit: '2mb' }))
 
 // ─── Rate limiting ───────────────────────────────────────────
 const globalLimiter = rateLimit({
@@ -284,6 +285,7 @@ app.use('/admin',        adminRouter)
 app.use('/api/billing',  dodoRouter)
 app.use('/api/ai',       authMiddleware, aiProxy)
 app.use('/api/project',  projectRouter)                            // ← ADAPTERv1 Session 6
+app.use('/api/user',     userRouter)                               // ← ADAPTERv1 Session 8 R-2
 
 // ─── WebSocket ───────────────────────────────────────────────
 const server = http.createServer(app)
