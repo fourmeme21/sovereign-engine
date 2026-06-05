@@ -141,7 +141,9 @@ export async function checkIntegrity(
   localMemoryPath: string | null,
 ): Promise<IntegrityCheckResult> {
 
-  // Son session'ı bul (closed_at IS NULL → açık kalmış)
+  // TB-5 FIX: .limit(1) kaldırıldı — tüm dirty session'lar alınıyor
+  // Önceki davranış: sadece en yeni dirty session kapatılıyordu,
+  // diğerleri closed_at=NULL olarak Supabase'de asılı kalıyordu.
   const { data: openSessions } = await supabase
     .from('project_sessions')
     .select('*')
@@ -149,7 +151,6 @@ export async function checkIntegrity(
     .eq('user_id', userId)
     .is('closed_at', null)
     .order('opened_at', { ascending: false })
-    .limit(1)
 
   if (!openSessions || openSessions.length === 0) {
     // Açık session yok — temiz başlangıç
@@ -161,12 +162,13 @@ export async function checkIntegrity(
     }
   }
 
+  // En yeni session → recovery checkpoint kaynağı
   const dirtySession = openSessions[0] as SessionRecord
-  console.warn(`[sessionManager] Dirty session tespit edildi: ${dirtySession.id}`)
+  console.warn(`[sessionManager] Dirty session tespit edildi: ${dirtySession.id} (toplam: ${openSessions.length})`)
 
   // ── Recovery ────────────────────────────────────────────────────────────
 
-  // 1. Dirty session'ı "recovered" olarak kapat
+  // 1. En yeni dirty session'ı "recovered" olarak kapat
   await supabase
     .from('project_sessions')
     .update({
@@ -176,15 +178,31 @@ export async function checkIntegrity(
     })
     .eq('id', dirtySession.id)
 
-  // 2. hot.json'da meta güncelle (varsa)
+  // 2. TB-5 FIX: Geri kalan orphan session'ları bulk kapat
+  const orphanIds = (openSessions as SessionRecord[]).slice(1).map(s => s.id)
+  if (orphanIds.length > 0) {
+    await supabase
+      .from('project_sessions')
+      .update({
+        closed_at:        new Date().toISOString(),
+        integrity_status: 'recovered',
+        close_reason:     'bulk_recovered',
+      })
+      .in('id', orphanIds)
+
+    console.warn(`[sessionManager] ${orphanIds.length} orphan session bulk temizlendi`)
+  }
+
+  // 3. hot.json'da meta güncelle (varsa)
   if (localMemoryPath) {
     const hot = readHotJson(localMemoryPath)
     const meta = (hot[HOT_SESSION_META_KEY] as Record<string, unknown>) ?? {}
     hot[HOT_SESSION_META_KEY] = {
       ...meta,
-      last_recovery:    new Date().toISOString(),
-      recovered_from:   dirtySession.id,
+      last_recovery:       new Date().toISOString(),
+      recovered_from:      dirtySession.id,
       recovery_checkpoint: dirtySession.checkpoint_data,
+      bulk_recovered:      orphanIds.length,
     }
     writeHotJson(localMemoryPath, hot)
   }
@@ -418,7 +436,7 @@ export async function markOrphanSessions(): Promise<void> {
         close_reason:     'engine_restart',
       })
       .is('closed_at', null)
-      .not('integrity_status', 'in', '("dirty","recovered")')  // Zaten işlenmiş olanları atla
+      .neq('integrity_status', 'dirty')  // Zaten dirty olanları tekrar işaretleme
       .select('id')
 
     if (error) {
