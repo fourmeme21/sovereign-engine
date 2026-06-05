@@ -552,4 +552,36 @@ router.post('/apply', async (req, res) => {
   }
 })
 
+// ─── POST /api/ai/session/close ──────────────────────────────
+//
+// ADAPTERv1 Session 11 — Normal session kapanışı
+//
+// Frontend uygulamayı kapatırken veya projeden çıkarken çağırır.
+// closeSession() → Supabase'de closed_at + integrity_status: 'healthy'
+// Çağrılmazsa: 30dk inactivity → auto-close (timeout) devreye girer.
+//
+// Body: { project_id, local_memory_path? }
+
+router.post('/session/close', async (req, res) => {
+  const userId = (req as any).user?.id ?? null
+
+  if (!userId) {
+    return res.status(401).json({ error: 'Yetkisiz' })
+  }
+
+  const { project_id, local_memory_path = null } = req.body
+
+  if (!project_id) {
+    return res.status(400).json({ error: 'project_id zorunlu' })
+  }
+
+  try {
+    await closeSession(userId, project_id, 'normal', local_memory_path)
+    return res.json({ closed: true, project_id })
+  } catch (err: any) {
+    console.error('[aiProxy/session/close] Hata:', err.message)
+    return res.status(500).json({ error: 'Session kapatılamadı' })
+  }
+})
+
 export default router
