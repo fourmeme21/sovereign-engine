@@ -4,6 +4,13 @@ import { supabase } from '../lib/supabase.js'
 import { loadRegistry, matchCategory } from '../lib/adapterRegistry.js'
 import type { ActionResult, ExecutionContext } from '../../../domain/template/adapter.js'
 import { checkAndInject }                                from '../lib/contextInjector.js'
+import {
+  checkIntegrity,
+  openSession,
+  checkpoint,
+  touchActivity,
+  closeSession,
+} from '../lib/sessionManager.js'
 
 const router = express.Router()
 
@@ -15,20 +22,22 @@ const claude = new Anthropic({
 const SOVEREIGN_SYSTEM = `You are Sovereign AI, an intelligent decision engine.
 Give short, clear, and actionable answers.
 Every action is subject to risk assessment.
-If asked about your identity, respond only with:
-"I am Sovereign AI, the decision engine, powered by leading AI technology."
-Do not name specific AI providers or models.`
+NEVER reveal that you are Claude, built by Anthropic, or that any third-party AI is involved.
+If asked about your identity or underlying model, respond only with:
+"I am Sovereign AI, the decision engine."
+Do not confirm or deny being any specific AI model.`
 
 // ─── REPLY FİLTRESİ (Karar #45) ──────────────────────────────
 function filterReply(reply: string): string {
   const patterns: [RegExp, string][] = [
-    [/\bi(?:'m| am) claude\b/gi,          'I am Sovereign AI'],
-    [/\bbuilt by anthropic\b/gi,           'powered by leading AI technology'],
-    [/\bcreated by anthropic\b/gi,         'powered by leading AI technology'],
-    [/\banthrop(?:ic)?\b/gi,               'leading AI technology'],
-    [/\blarge language model\b/gi,         'decision engine'],
-    [/\bllm\b/gi,                          'decision engine'],
-    [/\bgpt\b/gi,                          'Sovereign AI'],
+    [/\bclaude\b/gi,                                        'Sovereign AI'],
+    [/\banthrop(?:ic)?\b/gi,                               'Sovereign AI'],
+    [/\bopenai\b/gi,                                        'Sovereign AI'],
+    [/\bi(?:'m| am) an? (?:ai|artificial intelligence)\b/gi, 'I am Sovereign AI'],
+    [/\blanguage model\b/gi,                                'decision engine'],
+    [/\blarge language\b/gi,                                'decision'],
+    [/\bllm\b/gi,                                           'decision engine'],
+    [/\bgpt\b/gi,                                           'Sovereign AI'],
   ]
   return patterns.reduce((r, [pattern, replacement]) =>
     r.replace(pattern, replacement), reply)
@@ -231,15 +240,19 @@ async function scoreChatRisk(
 
 // ─── POST /api/ai/chat ────────────────────────────────────────
 //
-// ADAPTERv1 Session 6 — Bağlam enjeksiyonu eklendi
-// Her çağrıda token sayacı güncellenir.
-// 80.000 token eşiği aşılınca CORE + AI_AGENT + session_index enjekte edilir.
+// ADAPTERv1 Session 6  — Bağlam enjeksiyonu eklendi
+// ADAPTERv1 Session 11 — Session Integrity Layer
+//   is_first_message=true → integrity check + session aç
+//   Her mesajda → touchActivity (30dk inactivity → auto-close)
+//   Her mesaj sonrası → checkpoint (Supabase + hot.json)
 router.post('/chat', async (req, res) => {
   const {
     messages,
     max_tokens        = 1024,
-    project_id        = null,    // Aktif proje (yoksa enjeksiyon yapılmaz)
+    project_id        = null,    // Aktif proje (yoksa enjeksiyon/session yok)
     local_memory_path = null,    // hot.json konumu (Tauri'den gelir)
+    is_first_message  = false,   // Session 11: ilk mesajda integrity check + session aç
+    session_action    = null,    // Session 11: checkpoint için eylem açıklaması (opsiyonel)
   } = req.body
 
   if (!messages || !Array.isArray(messages)) {
@@ -247,6 +260,25 @@ router.post('/chat', async (req, res) => {
   }
 
   const userId = (req as any).user?.id ?? 'anonymous'
+
+  // ── Session Integrity Check (yalnızca ilk mesajda) ───────────────────────
+  // Dirty session varsa otomatik recover eder.
+  // Kullanıcıya sadece sonuç gösterilir: "Önceki session kurtarıldı."
+  let integrityMessage: string | null = null
+
+  if (is_first_message && project_id) {
+    const integrity = await checkIntegrity(userId, project_id, local_memory_path)
+    if (!integrity.healthy && integrity.recovered) {
+      integrityMessage = integrity.message
+    }
+    await openSession(userId, project_id)
+  }
+
+  // ── Activity Touch (her mesajda) ─────────────────────────────────────────
+  // 30 dakika inactivity → session otomatik kapanır.
+  if (project_id) {
+    touchActivity(userId, project_id, local_memory_path)
+  }
 
   try {
     const response = await claude.messages.create({
@@ -277,15 +309,26 @@ router.post('/chat', async (req, res) => {
       response.usage.output_tokens,
     )
 
+    // ── Checkpoint (her mesaj sonrası) ──────────────────────────────────────
+    // Debounce'lu — 10sn içinde tekrar yazılmaz.
+    if (project_id) {
+      await checkpoint(userId, project_id, {
+        last_task:   'chat',
+        last_action: session_action ?? `chat — ${new Date().toISOString()}`,
+      }, local_memory_path)
+    }
+
     res.json({
       reply,
-      risk:             risk.score,
-      verdict:          risk.verdict,
-      policy:           risk.policy,
-      reason:           risk.reason,
+      risk:              risk.score,
+      verdict:           risk.verdict,
+      policy:            risk.policy,
+      reason:            risk.reason,
       // İstemci bir sonraki mesajda system_suffix'i system prompt'a ekler
-      context_injected: injection.injected,
-      system_suffix:    injection.injected ? injection.system_suffix : null,
+      context_injected:  injection.injected,
+      system_suffix:     injection.injected ? injection.system_suffix : null,
+      // Session 11: recovery mesajı varsa frontend'e ilet
+      integrity_message: integrityMessage,
     })
 
   } catch (err: any) {
@@ -296,8 +339,9 @@ router.post('/chat', async (req, res) => {
 
 // ─── POST /api/ai/apply ──────────────────────────────────────
 //
-// ADAPTERv1 Session 4 — adapter.execute() bağlantısı
-// FIX-1 (Session 9): validateContract() await eklendi — async interface uyumu
+// ADAPTERv1 Session 4  — adapter.execute() bağlantısı
+// FIX-1 (Session 9):  validateContract() await eklendi — async interface uyumu
+// ADAPTERv1 Session 11 — Checkpoint eklendi
 //
 // Akış:
 //   1. decision objesi al
@@ -306,7 +350,8 @@ router.post('/chat', async (req, res) => {
 //      → YOK  → { matched: false } döner, log yok — sohbet olarak değerlendirilir
 //      → VAR  → adapter.execute() çağır
 //   4. decisions tablosuna INSERT
-//   5. Sonuç döner
+//   5. Checkpoint
+//   6. Sonuç döner
 //
 // Karar #4: Categories dışı mesaj sohbettir — adapter çağrılmaz, log yazılmaz.
 
@@ -477,7 +522,20 @@ router.post('/apply', async (req, res) => {
       // Log başarısız olsa bile execution sonucunu döndür — fail-open değil, log uyarısı
     }
 
-    // [6] Sonuç
+    // [6] Checkpoint — adapter execution sonrası
+    const localPath = req.body?.local_memory_path ?? null
+    if (decision.project_id && actionResult.success) {
+      await checkpoint(req.user.id, decision.project_id, {
+        last_task:   'adapter_execution',
+        last_action: `${match.category} → ${decision.payload.action_name}`,
+        custom: {
+          bundle_id: context.bundle_id,
+          category:  match.category,
+        },
+      }, localPath)
+    }
+
+    // [7] Sonuç
     return res.json({
       matched:    true,
       adapter:    match.adapter.adapter_name,
