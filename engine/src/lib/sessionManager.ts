@@ -418,7 +418,7 @@ export async function markOrphanSessions(): Promise<void> {
         close_reason:     'engine_restart',
       })
       .is('closed_at', null)
-      .neq('integrity_status', 'dirty')  // Zaten dirty olanları tekrar işaretleme
+      .not('integrity_status', 'in', '("dirty","recovered")')  // Zaten işlenmiş olanları atla
       .select('id')
 
     if (error) {
