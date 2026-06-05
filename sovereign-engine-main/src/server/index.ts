@@ -18,6 +18,7 @@ import aiProxy              from './routes/aiProxy.js'
 import projectRouter        from './routes/projectRouter.js'   // ← ADAPTERv1 Session 6
 import userRouter           from './routes/userRouter.js'      // ← ADAPTERv1 Session 8 R-2
 import { preloadProjectCache } from './lib/contextInjector.js'        // ← ADAPTERv1 Session 6
+import { markOrphanSessions }  from './lib/sessionManager.js'         // ← ADAPTERv1 Session 11
 import jwt from 'jsonwebtoken'
 
 // ─── JWT SECRET ──────────────────────────────────────────────
@@ -309,6 +310,8 @@ server.listen(PORT, '0.0.0.0', async () => {
   console.log(`Sovereign Engine :${PORT}`)
   console.log(`Origins: ${ALLOWED_ORIGINS.join(', ')}`)
   console.log(`MCP_URL: ${MCP_URL || 'not configured'}`)
+  // ADAPTERv1 Session 11 — Restart öncesi açık kalan session'ları dirty işaretle
+  await markOrphanSessions()
   // ADAPTERv1 Session 6 — Proje cache'lerini ön yükle
   await preloadProjectCache()
 })
