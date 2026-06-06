@@ -128,6 +128,10 @@ async function mcpProxy(subpath: string, body?: unknown) {
 
 const app = express()
 
+// ─── TRUST PROXY (Railway / reverse proxy desteği) ───────────
+// Fix: express-rate-limit ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+app.set('trust proxy', 1)
+
 // ─── CORS ────────────────────────────────────────────────────
 const ALLOWED_ORIGINS = [
   process.env['APP_URL'],
@@ -136,10 +140,14 @@ const ALLOWED_ORIGINS = [
   'http://localhost:4173',
 ].filter(Boolean) as string[]
 
+// Fix: Vercel preview URL'leri dinamik subdomain üretir — pattern matching gerekli
+const VERCEL_PREVIEW_PATTERN = /^https:\/\/sovereign-os[^.]*\.vercel\.app$/
+
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true)
     if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true)
+    if (VERCEL_PREVIEW_PATTERN.test(origin)) return callback(null, true)
     callback(new Error(`CORS: izin verilmeyen origin — ${origin}`))
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
