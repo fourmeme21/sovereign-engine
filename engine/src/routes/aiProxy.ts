@@ -2,7 +2,8 @@
 // Amaç:    AI chat + karar (apply) endpoint'leri — Anthropic proxy, risk skoru, session yönetimi
 // Bağlı:   decisions tablosu, memory_chunks tablosu, project_sessions, adapterRegistry, sessionManager
 // Karar:   #45 (kimlik kilidi), #52 (validateContract async), #53 (iş dili), #54 (express.d.ts),
-//          #68 (/session/close), #69 (tam merge), #77 (R-4 env abstraction), Session 18 (memory_chunks INSERT)
+//          #68 (/session/close), #69 (tam merge), #77 (R-4 env abstraction), Session 18 (memory_chunks INSERT),
+//          #89 (session_index.md üretimi backend sorumluluğu), #90 (insan onayı merkezde)
 // Dokunma: memory_chunks INSERT kaldırılırsa TB-2 geri açılır. scoreChatRisk hibrit engine'e dokunma.
 
 import express from 'express'
@@ -263,7 +264,7 @@ async function writeDecisionMemory(params: {
     .insert({
       user_id:     params.userId,
       project_id:  params.projectId,
-      session_id:  params.sessionId,   // nullable — FK riski yok
+      session_id:  params.sessionId,
       memory_type: 'decision',
       content,
       metadata: {
@@ -275,8 +276,74 @@ async function writeDecisionMemory(params: {
     })
 
   if (error) {
-    // Non-critical — logluyoruz ama fırlatmıyoruz
     console.error('[writeDecisionMemory] memory_chunks insert hatası:', error.message)
+  }
+}
+
+// ─── SESSION ÖZETİ PROMPT OLUŞTURUCU (Karar #89, #90) ────────
+// Amaç:    Claude'a gönderilecek session özet promptunu üretir
+// Kural:   Son 30 mesaj alınır — uzun geçmişlerde token tasarrufu
+// Edge:    Mesaj yoksa boş history ile prompt üretilir
+
+function buildSummaryPrompt(
+  messages: Array<{ role: string; content: string }>
+): string {
+  const history = messages
+    .slice(-30)
+    .map(m => `[${m.role.toUpperCase()}]: ${m.content}`)
+    .join('\n')
+
+  return `Sen bir session özet motorusun. Aşağıdaki konuşma geçmişini analiz et ve session_index.md formatında bir özet üret.
+
+KONUŞMA GEÇMİŞİ:
+${history || '(Konuşma geçmişi boş)'}
+
+Aşağıdaki formatta SADECE özet üret, başka hiçbir şey ekleme:
+
+## Yapılanlar
+- [ne yapıldı — somut çıktı belirt]
+
+## Kararlar
+- [bu session'da alınan kararlar]
+
+## Blocker
+[varsa blocker — yoksa "Yok"]
+
+## Sıradaki
+[bir sonraki session tam olarak nereden başlamalı]
+
+Kurallar:
+- Türkçe yaz
+- Her madde somut ve tek satır olsun
+- Tahmin etme — konuşmada olmayan bilgiyi ekleme
+- Blocker yoksa "Yok" yaz, boş bırakma`
+}
+
+// ─── SESSION ÖZETİ ÜRETİCİ (Karar #89, #90) ──────────────────
+// Amaç:    Claude'a session özeti ürettir — kullanıcı onayına sunulacak
+// Bağlı:   /api/ai/session/close endpoint'i
+// Edge:    API hatası → content boş döner, summary_error dolu gelir — frontend elle yazma sunar
+
+async function generateSessionSummary(params: {
+  userId:    string
+  projectId: string
+  messages:  Array<{ role: string; content: string }>
+}): Promise<{ content: string; error: string | null }> {
+  const prompt = buildSummaryPrompt(params.messages)
+
+  try {
+    const response = await claude.messages.create({
+      model:      AI_MODEL,
+      max_tokens: 1500,
+      messages:   [{ role: 'user', content: prompt }],
+    })
+
+    const content = (response.content[0] as Anthropic.TextBlock)?.text ?? ''
+    return { content, error: null }
+
+  } catch (err: any) {
+    console.error('[generateSessionSummary] Claude hatası:', err.message)
+    return { content: '', error: err.message }
   }
 }
 
@@ -524,6 +591,12 @@ router.post('/apply', async (req, res) => {
 })
 
 // ─── POST /api/ai/session/close ──────────────────────────────
+// Amaç:    Session'ı kapat, Claude'a özet ürettir, kullanıcı onayına hazır döndür
+// Karar:   #89 (backend üretim sorumluluğu), #90 (insan sezgisi merkez)
+// Edge:    Claude hatası → summary_error dolu, content boş — frontend elle yazma sunar
+//          messages boşsa → Claude "geçmiş yok" özetiyle döner
+//          project_id eksikse → 400
+
 router.post('/session/close', async (req, res) => {
   const userId = (req as any).user?.id ?? null
 
@@ -531,7 +604,11 @@ router.post('/session/close', async (req, res) => {
     return res.status(401).json({ error: 'Yetkisiz' })
   }
 
-  const { project_id, local_memory_path = null } = req.body
+  const {
+    project_id,
+    local_memory_path = null,
+    messages          = [],
+  } = req.body
 
   if (!project_id) {
     return res.status(400).json({ error: 'project_id zorunlu' })
@@ -539,7 +616,20 @@ router.post('/session/close', async (req, res) => {
 
   try {
     await closeSession(userId, project_id, 'normal', local_memory_path)
-    return res.json({ closed: true, project_id })
+
+    const { content, error } = await generateSessionSummary({
+      userId,
+      projectId: project_id,
+      messages,
+    })
+
+    return res.json({
+      closed:          true,
+      project_id,
+      summary_content: content,
+      summary_error:   error,
+    })
+
   } catch (err: any) {
     console.error('[aiProxy/session/close] Hata:', err.message)
     return res.status(500).json({ error: 'Session kapatılamadı' })
