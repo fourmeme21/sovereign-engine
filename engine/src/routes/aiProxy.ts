@@ -18,7 +18,8 @@ const claude = new Anthropic({
   apiKey: process.env['AI_API_KEY'] ?? process.env['ANTHROPIC_API_KEY'],
 })
 
-const AI_MODEL = process.env['AI_MODEL'] ?? 'claude-sonnet-4-20250514'
+// Fix: claude-sonnet-4-20250514 → 404 Not Found — güncel model adı
+const AI_MODEL = process.env['AI_MODEL'] ?? 'claude-sonnet-4-5'
 
 // ─── KİMLİK KİLİDİ (Karar #45) ───────────────────────────────
 const SOVEREIGN_SYSTEM = `You are Sovereign AI, an intelligent decision engine.
@@ -251,10 +252,10 @@ router.post('/chat', async (req, res) => {
   const {
     messages,
     max_tokens        = 1024,
-    project_id        = null,    // Aktif proje (yoksa enjeksiyon/session yok)
-    local_memory_path = null,    // hot.json konumu (Tauri'den gelir)
-    is_first_message  = false,   // Session 11: ilk mesajda integrity check + session aç
-    session_action    = null,    // Session 11: checkpoint için eylem açıklaması (opsiyonel)
+    project_id        = null,
+    local_memory_path = null,
+    is_first_message  = false,
+    session_action    = null,
   } = req.body
 
   if (!messages || !Array.isArray(messages)) {
@@ -263,9 +264,6 @@ router.post('/chat', async (req, res) => {
 
   const userId = (req as any).user?.id ?? 'anonymous'
 
-  // ── Session Integrity Check (yalnızca ilk mesajda) ───────────────────────
-  // Dirty session varsa otomatik recover eder.
-  // Kullanıcıya sadece sonuç gösterilir: "Önceki session kurtarıldı."
   let integrityMessage: string | null = null
 
   if (is_first_message && project_id) {
@@ -276,8 +274,6 @@ router.post('/chat', async (req, res) => {
     await openSession(userId, project_id)
   }
 
-  // ── Activity Touch (her mesajda) ─────────────────────────────────────────
-  // 30 dakika inactivity → session otomatik kapanır.
   if (project_id) {
     touchActivity(userId, project_id, local_memory_path)
   }
@@ -300,9 +296,6 @@ router.post('/chat', async (req, res) => {
 
     const risk = await scoreChatRisk(userText, reply, claude)
 
-    // ── Bağlam Enjeksiyonu ────────────────────────────────────────────────
-    // Token kullanımını kaydet, eşik aşıldıysa enjeksiyon içeriği al.
-    // Kullanıcı bunu görmez — bir sonraki API çağrısında system prompt'a eklenir.
     const injection = await checkAndInject(
       userId,
       project_id,
@@ -311,8 +304,6 @@ router.post('/chat', async (req, res) => {
       response.usage.output_tokens,
     )
 
-    // ── Checkpoint (her mesaj sonrası) ──────────────────────────────────────
-    // Debounce'lu — 10sn içinde tekrar yazılmaz.
     if (project_id) {
       await checkpoint(userId, project_id, {
         last_task:   'chat',
@@ -326,10 +317,8 @@ router.post('/chat', async (req, res) => {
       verdict:           risk.verdict,
       policy:            risk.policy,
       reason:            risk.reason,
-      // İstemci bir sonraki mesajda system_suffix'i system prompt'a ekler
       context_injected:  injection.injected,
       system_suffix:     injection.injected ? injection.system_suffix : null,
-      // Session 11: recovery mesajı varsa frontend'e ilet
       integrity_message: integrityMessage,
     })
 
@@ -344,19 +333,6 @@ router.post('/chat', async (req, res) => {
 // ADAPTERv1 Session 4  — adapter.execute() bağlantısı
 // FIX-1 (Session 9):  validateContract() await eklendi — async interface uyumu
 // ADAPTERv1 Session 11 — Checkpoint eklendi
-//
-// Akış:
-//   1. decision objesi al
-//   2. loadRegistry → kullanıcının aktif adapter'larını yükle
-//   3. matchCategory → bu category için adapter var mı?
-//      → YOK  → { matched: false } döner, log yok — sohbet olarak değerlendirilir
-//      → VAR  → adapter.execute() çağır
-//   4. decisions tablosuna INSERT
-//   5. Checkpoint
-//   6. Sonuç döner
-//
-// Karar #4: Categories dışı mesaj sohbettir — adapter çağrılmaz, log yazılmaz.
-
 router.post('/apply', async (req, res) => {
   if (!req.user) {
     return res.status(401).json({ error: 'Yetkisiz' })
@@ -373,15 +349,11 @@ router.post('/apply', async (req, res) => {
   }
 
   try {
-    // [1] Registry yükle
     const tier     = req.userTier ?? 'free'
     const registry = await loadRegistry(req.user.id, tier)
-
-    // [2] Kategori eşleştir
-    const match = matchCategory(decision.category, registry)
+    const match    = matchCategory(decision.category, registry)
 
     if (!match.matched || !match.adapter) {
-      // Karar #4: Categories dışı → sohbet, log yok
       return res.json({
         matched:  false,
         message:  'Bu kategori için adapter tanımlı değil — sohbet olarak değerlendirildi.',
@@ -389,7 +361,6 @@ router.post('/apply', async (req, res) => {
       })
     }
 
-    // [3] Execution context oluştur
     const context: ExecutionContext = {
       actor_id:   req.user.id,
       actor_role: tier,
@@ -398,83 +369,42 @@ router.post('/apply', async (req, res) => {
       timestamp:  new Date().toISOString(),
     }
 
-    // [4] Adapter'ı vm sandbox ile yükle ve execute et — R-7 güvenlik geçişi
-    //
-    // Güvenlik katmanları:
-    //   KAT-1: Statik analiz  — yasak pattern tespiti (process, require, fs, eval...)
-    //   KAT-2: vm sandbox     — izole context, global erişim yok
-    //   KAT-3: Timeout        — 3000ms sınırı, sonsuz döngü koruması
-    //
-    // adapter_code Claude tarafından üretilir (operator kontrollü).
-    // RLS ile kullanıcı bazlı izolasyon Supabase katmanında sağlanır.
     let actionResult: ActionResult
 
     try {
-      // ── KAT-1: STATİK ANALİZ ──────────────────────────────────────────────
       const FORBIDDEN_PATTERNS = [
-        'process.env',
-        'process.exit',
-        'child_process',
-        'require(',
-        '__dirname',
-        '__filename',
-        'fs.',
-        'fetch(',
-        'axios',
-        'XMLHttpRequest',
-        'eval(',
-        'new Function(',
-        'global.',
-        'globalThis.',
+        'process.env', 'process.exit', 'child_process', 'require(',
+        '__dirname', '__filename', 'fs.', 'fetch(', 'axios',
+        'XMLHttpRequest', 'eval(', 'new Function(', 'global.', 'globalThis.',
       ]
 
       for (const pattern of FORBIDDEN_PATTERNS) {
         if (match.adapter.adapter_code.includes(pattern)) {
-          throw new Error(
-            `[R-7] Güvenlik ihlali: adapter_code yasak pattern içeriyor → "${pattern}"`,
-          )
+          throw new Error(`[R-7] Güvenlik ihlali: adapter_code yasak pattern içeriyor → "${pattern}"`)
         }
       }
 
-      // ── KAT-2: VM SANDBOX ─────────────────────────────────────────────────
-      // Sadece güvenli primitive'ler sandbox'a açılır.
-      // process, require, fs, global → tamamen kapalı.
       const { createContext, Script } = await import('vm')
 
       const sandboxExports: Record<string, unknown> = {}
       const sandbox = createContext({
-        exports:    sandboxExports,
+        exports: sandboxExports,
         console: {
           log:   (...args: unknown[]) => console.log('[adapter]', ...args),
           warn:  (...args: unknown[]) => console.warn('[adapter]', ...args),
           error: (...args: unknown[]) => console.error('[adapter]', ...args),
         },
-        setTimeout,
-        clearTimeout,
-        Promise,
-        JSON,
-        Math,
-        Date,
-        Error,
-        Array,
-        Object,
-        String,
-        Number,
-        Boolean,
-        Map,
-        Set,
+        setTimeout, clearTimeout, Promise, JSON, Math, Date, Error,
+        Array, Object, String, Number, Boolean, Map, Set,
       })
 
-      // ── KAT-3: TIMEOUT ────────────────────────────────────────────────────
-      // 3000ms — sonsuz döngü veya blocking I/O koruması.
       const script = new Script(match.adapter.adapter_code)
       script.runInContext(sandbox, { timeout: 3000 })
 
-      // Adapter sınıfını sandbox'tan al
       const AdapterClass = (sandboxExports.default ??
         Object.values(sandboxExports)[0]) as new () => {
           execute: (action: string, params: Record<string, unknown>, ctx: ExecutionContext) => Promise<ActionResult>
-          validateContract: () => Promise<boolean>  // FIX-1: async olarak düzeltildi
+          validateContract: () => Promise<boolean>
         }
 
       if (typeof AdapterClass !== 'function') {
@@ -483,7 +413,6 @@ router.post('/apply', async (req, res) => {
 
       const adapterInst = new AdapterClass()
 
-      // FIX-1 (Session 9): validateContract() async — await eklendi
       if (typeof adapterInst.validateContract === 'function') {
         const valid = await adapterInst.validateContract()
         if (!valid) {
@@ -498,12 +427,10 @@ router.post('/apply', async (req, res) => {
       )
 
     } catch (execErr: any) {
-      // FP-R1: Binary/adapter crash → fail-closed
       console.error('[aiProxy/apply] adapter.execute() hatası:', execErr.message)
       actionResult = { success: false, error: `Adapter execution hatası: ${execErr.message}` }
     }
 
-    // [5] decisions tablosuna log yaz
     const { error: dbError } = await supabase
       .from('decisions')
       .insert({
@@ -521,10 +448,8 @@ router.post('/apply', async (req, res) => {
 
     if (dbError) {
       console.error('[aiProxy/apply] Supabase insert hatası:', dbError.message)
-      // Log başarısız olsa bile execution sonucunu döndür — fail-open değil, log uyarısı
     }
 
-    // [6] Checkpoint — adapter execution sonrası
     const localPath = req.body?.local_memory_path ?? null
     if (decision.project_id && actionResult.success) {
       await checkpoint(req.user.id, decision.project_id, {
@@ -537,15 +462,14 @@ router.post('/apply', async (req, res) => {
       }, localPath)
     }
 
-    // [7] Sonuç
     return res.json({
-      matched:    true,
-      adapter:    match.adapter.adapter_name,
-      category:   match.category,
-      bundle_id:  context.bundle_id,
-      success:    actionResult.success,
-      output:     actionResult.output ?? null,
-      error:      actionResult.error  ?? null,
+      matched:   true,
+      adapter:   match.adapter.adapter_name,
+      category:  match.category,
+      bundle_id: context.bundle_id,
+      success:   actionResult.success,
+      output:    actionResult.output ?? null,
+      error:     actionResult.error  ?? null,
     })
 
   } catch (err: any) {
@@ -555,15 +479,6 @@ router.post('/apply', async (req, res) => {
 })
 
 // ─── POST /api/ai/session/close ──────────────────────────────
-//
-// ADAPTERv1 Session 11 — Normal session kapanışı
-//
-// Frontend uygulamayı kapatırken veya projeden çıkarken çağırır.
-// closeSession() → Supabase'de closed_at + integrity_status: 'healthy'
-// Çağrılmazsa: 30dk inactivity → auto-close (timeout) devreye girer.
-//
-// Body: { project_id, local_memory_path? }
-
 router.post('/session/close', async (req, res) => {
   const userId = (req as any).user?.id ?? null
 
