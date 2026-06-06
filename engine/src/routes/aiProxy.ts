@@ -15,8 +15,10 @@ import {
 const router = express.Router()
 
 const claude = new Anthropic({
-  apiKey: process.env['ANTHROPIC_API_KEY'],
+  apiKey: process.env['AI_API_KEY'] ?? process.env['ANTHROPIC_API_KEY'],
 })
+
+const AI_MODEL = process.env['AI_MODEL'] ?? 'claude-sonnet-4-20250514'
 
 // ─── KİMLİK KİLİDİ (Karar #45) ───────────────────────────────
 const SOVEREIGN_SYSTEM = `You are Sovereign AI, an intelligent decision engine.
@@ -177,7 +179,7 @@ Karar kuralları:
 
   try {
     const response = await claudeClient.messages.create({
-      model:      'claude-sonnet-4-20250514',
+      model:      AI_MODEL,
       max_tokens: 200,
       messages:   [{ role: 'user', content: prompt }],
     })
@@ -282,7 +284,7 @@ router.post('/chat', async (req, res) => {
 
   try {
     const response = await claude.messages.create({
-      model:      'claude-sonnet-4-20250514',
+      model:      AI_MODEL,
       max_tokens,
       system:     SOVEREIGN_SYSTEM,
       messages,
