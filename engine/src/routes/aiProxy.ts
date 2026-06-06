@@ -1,3 +1,10 @@
+// aiProxy.ts
+// Amaç:    AI chat + karar (apply) endpoint'leri — Anthropic proxy, risk skoru, session yönetimi
+// Bağlı:   decisions tablosu, memory_chunks tablosu, project_sessions, adapterRegistry, sessionManager
+// Karar:   #45 (kimlik kilidi), #52 (validateContract async), #53 (iş dili), #54 (express.d.ts),
+//          #68 (/session/close), #69 (tam merge), #77 (R-4 env abstraction), Session 18 (memory_chunks INSERT)
+// Dokunma: memory_chunks INSERT kaldırılırsa TB-2 geri açılır. scoreChatRisk hibrit engine'e dokunma.
+
 import express from 'express'
 import Anthropic from '@anthropic-ai/sdk'
 import { supabase } from '../lib/supabase.js'
@@ -18,7 +25,6 @@ const claude = new Anthropic({
   apiKey: process.env['AI_API_KEY'] ?? process.env['ANTHROPIC_API_KEY'],
 })
 
-// Fix: claude-sonnet-4-20250514 → 404 Not Found — güncel model adı
 const AI_MODEL = process.env['AI_MODEL'] ?? 'claude-sonnet-4-5'
 
 // ─── KİMLİK KİLİDİ (Karar #45) ───────────────────────────────
@@ -80,7 +86,6 @@ interface QuickFilterResult {
 function quickRiskFilter(message: string): QuickFilterResult {
   const msg = message.toLowerCase()
 
-  // DENY — açık tehlikeler (skor 10)
   const denyPatterns: [RegExp, string][] = [
     [/şifr[ei]\w*\s*(ver|gönder|yaz|paylaş)/i,       'Kimlik bilgisi talebi tespit edildi.'],
     [/api.?key\w*\s*(ver|gönder|yaz|paylaş)/i,        'API anahtarı talebi tespit edildi.'],
@@ -95,7 +100,6 @@ function quickRiskFilter(message: string): QuickFilterResult {
     }
   }
 
-  // ASK_HUMAN — yüksek risk (skor 7-9)
   const askPatterns: [RegExp, string, number][] = [
     [/(tüm|bütün|hepsini).*(sil|kaldır|temizle)/i,    'Toplu silme işlemi insan onayı gerektirir.', 9],
     [/geri\s*al[ı]?namaz/i,                            'Geri alınamaz işlem insan onayı gerektirir.', 8],
@@ -112,7 +116,6 @@ function quickRiskFilter(message: string): QuickFilterResult {
     }
   }
 
-  // Orta risk — Claude analizine gönder (skor 4)
   const mediumPatterns: RegExp[] = [
     /(güncelle|değiştir|düzenle|yaz|ekle|kaydet)/i,
     /(oluştur|yarat|üret|generate)/i,
@@ -132,7 +135,6 @@ function quickRiskFilter(message: string): QuickFilterResult {
     }
   }
 
-  // Düşük risk — PERMIT (skor 2)
   return {
     triggered: false,
     score:     2,
@@ -189,7 +191,6 @@ Karar kuralları:
     const clean  = raw.replace(/```json|```/g, '').trim()
     const parsed = JSON.parse(clean)
 
-    // Tip güvenliği — Claude beklenmedik değer dönerse fail-closed
     const validVerdicts = ['PERMIT', 'ASK_HUMAN', 'DENY'] as const
     const validPolicies = ['POL-CHAT-001', 'POL-CHAT-002', 'POL-CHAT-003', 'POL-CHAT-004', 'POL-CHAT-DENY'] as const
 
@@ -201,7 +202,6 @@ Karar kuralları:
     return { score, verdict, policy, reason }
 
   } catch (err: any) {
-    // Analiz başarısız → fail-closed: ASK_HUMAN
     console.warn('[scoreChatRisk] Claude analiz hatası — fail-closed ASK_HUMAN:', err.message)
     return {
       score:   6,
@@ -219,11 +219,8 @@ async function scoreChatRisk(
   assistantReply: string,
   claudeClient:   Anthropic,
 ): Promise<ChatRiskResult> {
-
-  // KAT-1: Hızlı filtre
   const quick = quickRiskFilter(userMessage)
 
-  // DENY veya yüksek ASK_HUMAN → Claude'a gitme, direkt dön
   if (quick.verdict === 'DENY') {
     return { score: quick.score, verdict: quick.verdict, policy: quick.policy, reason: quick.reason }
   }
@@ -232,22 +229,58 @@ async function scoreChatRisk(
     return { score: quick.score, verdict: quick.verdict, policy: quick.policy, reason: quick.reason }
   }
 
-  // KAT-2: Orta risk → Claude analizi
   if (quick.score >= 4) {
     return analyzeRiskWithClaude(userMessage, assistantReply, claudeClient)
   }
 
-  // KAT-3: Düşük risk → direkt PERMIT
   return { score: quick.score, verdict: quick.verdict, policy: quick.policy, reason: quick.reason }
 }
 
+// ─── MEMORY YAZICI — decision (Session 18) ───────────────────
+// Amaç:    Başarılı adapter execution'larını memory_chunks'a yazar
+// Kural:   Non-critical — hata olsa response bloklenmaz
+// Edge:    project_id null ise atlanır / session_id nullable geçilir
+
+async function writeDecisionMemory(params: {
+  userId:      string
+  projectId:   string
+  sessionId:   string | null
+  category:    string
+  actionName:  string
+  bundleId:    string
+  riskLevel:   string
+  output:      unknown
+}): Promise<void> {
+  const content = [
+    `Karar: ${params.category} → ${params.actionName}`,
+    `Sonuç: ${params.output ? JSON.stringify(params.output).slice(0, 200) : 'tamamlandı'}`,
+    `Bundle: ${params.bundleId}`,
+    `Risk: ${params.riskLevel}`,
+  ].join('\n')
+
+  const { error } = await supabase
+    .from('memory_chunks')
+    .insert({
+      user_id:     params.userId,
+      project_id:  params.projectId,
+      session_id:  params.sessionId,   // nullable — FK riski yok
+      memory_type: 'decision',
+      content,
+      metadata: {
+        category:    params.category,
+        action_name: params.actionName,
+        bundle_id:   params.bundleId,
+        status:      'COMPLETED',
+      },
+    })
+
+  if (error) {
+    // Non-critical — logluyoruz ama fırlatmıyoruz
+    console.error('[writeDecisionMemory] memory_chunks insert hatası:', error.message)
+  }
+}
+
 // ─── POST /api/ai/chat ────────────────────────────────────────
-//
-// ADAPTERv1 Session 6  — Bağlam enjeksiyonu eklendi
-// ADAPTERv1 Session 11 — Session Integrity Layer
-//   is_first_message=true → integrity check + session aç
-//   Her mesajda → touchActivity (30dk inactivity → auto-close)
-//   Her mesaj sonrası → checkpoint (Supabase + hot.json)
 router.post('/chat', async (req, res) => {
   const {
     messages,
@@ -329,10 +362,6 @@ router.post('/chat', async (req, res) => {
 })
 
 // ─── POST /api/ai/apply ──────────────────────────────────────
-//
-// ADAPTERv1 Session 4  — adapter.execute() bağlantısı
-// FIX-1 (Session 9):  validateContract() await eklendi — async interface uyumu
-// ADAPTERv1 Session 11 — Checkpoint eklendi
 router.post('/apply', async (req, res) => {
   if (!req.user) {
     return res.status(401).json({ error: 'Yetkisiz' })
@@ -431,6 +460,7 @@ router.post('/apply', async (req, res) => {
       actionResult = { success: false, error: `Adapter execution hatası: ${execErr.message}` }
     }
 
+    // ── decisions tablosuna yaz ───────────────────────────────
     const { error: dbError } = await supabase
       .from('decisions')
       .insert({
@@ -447,9 +477,24 @@ router.post('/apply', async (req, res) => {
       })
 
     if (dbError) {
-      console.error('[aiProxy/apply] Supabase insert hatası:', dbError.message)
+      console.error('[aiProxy/apply] Supabase decisions insert hatası:', dbError.message)
     }
 
+    // ── memory_chunks'a yaz — sadece başarılı + project_id varsa (Session 18) ──
+    if (actionResult.success && decision.project_id) {
+      await writeDecisionMemory({
+        userId:     req.user.id,
+        projectId:  decision.project_id,
+        sessionId:  decision.context?.session_id ?? null,
+        category:   match.category,
+        actionName: decision.payload.action_name,
+        bundleId:   context.bundle_id,
+        riskLevel:  decision.context?.risk_level ?? 'LOW',
+        output:     actionResult.output ?? null,
+      })
+    }
+
+    // ── checkpoint ───────────────────────────────────────────
     const localPath = req.body?.local_memory_path ?? null
     if (decision.project_id && actionResult.success) {
       await checkpoint(req.user.id, decision.project_id, {
