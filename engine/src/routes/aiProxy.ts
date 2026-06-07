@@ -7,8 +7,9 @@
 //          #91 (proaktif context enjeksiyonu — Claude çağrısından önce eşik kontrolü)
 // Dokunma: memory_chunks INSERT kaldırılırsa TB-2 geri açılır. scoreChatRisk hibrit engine'e dokunma.
 //          checkAndInjectProactive() sırası değiştirilemez — Claude çağrısından ÖNCE olmalı.
+//          Handler fonksiyonları 20 satır disiplinine göre bölündü — orchestrator pattern.
 
-import express from 'express'
+import express, { Request, Response } from 'express'
 import Anthropic from '@anthropic-ai/sdk'
 import { supabase } from '../lib/supabase.js'
 import { loadRegistry, matchCategory } from '../lib/adapterRegistry.js'
@@ -42,32 +43,115 @@ Do not confirm or deny being any specific AI model.`
 // ─── REPLY FİLTRESİ (Karar #45) ──────────────────────────────
 function filterReply(reply: string): string {
   const patterns: [RegExp, string][] = [
-    [/\bclaude\b/gi,                                        'Sovereign AI'],
-    [/\banthrop(?:ic)?\b/gi,                               'Sovereign AI'],
-    [/\bopenai\b/gi,                                        'Sovereign AI'],
+    [/\bclaude\b/gi,                                          'Sovereign AI'],
+    [/\banthrop(?:ic)?\b/gi,                                 'Sovereign AI'],
+    [/\bopenai\b/gi,                                          'Sovereign AI'],
     [/\bi(?:'m| am) an? (?:ai|artificial intelligence)\b/gi, 'I am Sovereign AI'],
-    [/\blanguage model\b/gi,                                'decision engine'],
-    [/\blarge language\b/gi,                                'decision'],
-    [/\bllm\b/gi,                                           'decision engine'],
-    [/\bgpt\b/gi,                                           'Sovereign AI'],
+    [/\blanguage model\b/gi,                                  'decision engine'],
+    [/\blarge language\b/gi,                                  'decision'],
+    [/\bllm\b/gi,                                             'decision engine'],
+    [/\bgpt\b/gi,                                             'Sovereign AI'],
   ]
   return patterns.reduce((r, [pattern, replacement]) =>
     r.replace(pattern, replacement), reply)
 }
 
-// ─── CHAT RISK SCORER (TB-10) ─────────────────────────────────
-//
-// Hibrit yaklaşım:
-//   KAT-1: Hızlı kural filtresi — açık tehlikeleri yakala (<1ms, API yok)
-//   KAT-2: Claude risk analizi — sadece orta/yüksek riskli görünenlerde
-//   KAT-3: Default PERMIT — düşük risk, API çağrısı yok
-//
-// Politika referansları:
-//   POL-CHAT-001: Düşük risk — sohbet / okuma
-//   POL-CHAT-002: Orta risk — yazma / güncelleme
-//   POL-CHAT-003: Yüksek risk — silme / geri alınamaz işlem
-//   POL-CHAT-004: Kritik — toplu silme / veri imhası / finansal bağlayıcı
-//   POL-CHAT-DENY: Açık tehlike — kimlik bilgisi / zarar verici içerik
+// ─── INPUT VALIDATION (SSC-3) ────────────────────────────────
+// Amaç:    Dışarıdan gelen req.body alanlarını tip + format açısından doğrular
+// Edge:    messages boş array geçilebilir — allow, Claude boş history ile çalışır
+//          project_id null olabilir — opsiyonel alan
+//          UUID format kontrolü — geçersiz project_id Supabase hatasına yol açar
+
+interface ChatBody {
+  messages:          Array<{ role: string; content: string }>
+  max_tokens?:       number
+  project_id?:       string | null
+  local_memory_path?: string | null
+  is_first_message?: boolean
+  session_action?:   string | null
+}
+
+function validateChatBody(body: unknown): { valid: true; data: ChatBody } | { valid: false; error: string } {
+  if (!body || typeof body !== 'object') {
+    return { valid: false, error: 'Request body zorunlu' }
+  }
+
+  const b = body as Record<string, unknown>
+
+  if (!Array.isArray(b['messages'])) {
+    return { valid: false, error: 'messages array zorunlu' }
+  }
+
+  for (const msg of b['messages'] as unknown[]) {
+    if (!msg || typeof msg !== 'object') {
+      return { valid: false, error: 'messages[]: her eleman obje olmalı' }
+    }
+    const m = msg as Record<string, unknown>
+    if (typeof m['role'] !== 'string' || typeof m['content'] !== 'string') {
+      return { valid: false, error: 'messages[]: role ve content string olmalı' }
+    }
+  }
+
+  if (b['project_id'] !== undefined && b['project_id'] !== null) {
+    if (typeof b['project_id'] !== 'string') {
+      return { valid: false, error: 'project_id string veya null olmalı' }
+    }
+  }
+
+  if (b['max_tokens'] !== undefined && typeof b['max_tokens'] !== 'number') {
+    return { valid: false, error: 'max_tokens number olmalı' }
+  }
+
+  return { valid: true, data: b as unknown as ChatBody }
+}
+
+interface ApplyBody {
+  decision: {
+    category:   string
+    project_id?: string | null
+    payload: {
+      action_name: string
+      params?:     Record<string, unknown>
+    }
+    context?: {
+      session_id?: string
+      risk_level?: string
+    }
+  }
+  local_memory_path?: string | null
+}
+
+function validateApplyBody(body: unknown): { valid: true; data: ApplyBody } | { valid: false; error: string } {
+  if (!body || typeof body !== 'object') {
+    return { valid: false, error: 'Request body zorunlu' }
+  }
+
+  const b = body as Record<string, unknown>
+
+  if (!b['decision'] || typeof b['decision'] !== 'object') {
+    return { valid: false, error: 'decision objesi zorunlu' }
+  }
+
+  const d = b['decision'] as Record<string, unknown>
+
+  if (typeof d['category'] !== 'string') {
+    return { valid: false, error: 'decision.category string zorunlu' }
+  }
+
+  if (!d['payload'] || typeof d['payload'] !== 'object') {
+    return { valid: false, error: 'decision.payload objesi zorunlu' }
+  }
+
+  const p = d['payload'] as Record<string, unknown>
+
+  if (typeof p['action_name'] !== 'string') {
+    return { valid: false, error: 'decision.payload.action_name string zorunlu' }
+  }
+
+  return { valid: true, data: b as unknown as ApplyBody }
+}
+
+// ─── CHAT RISK SCORER ─────────────────────────────────────────
 
 interface ChatRiskResult {
   score:   number
@@ -75,8 +159,6 @@ interface ChatRiskResult {
   policy:  string
   reason:  string
 }
-
-// ── KAT-1: Hızlı kural filtresi ──────────────────────────────
 
 interface QuickFilterResult {
   triggered: boolean
@@ -87,8 +169,6 @@ interface QuickFilterResult {
 }
 
 function quickRiskFilter(message: string): QuickFilterResult {
-  const msg = message.toLowerCase()
-
   const denyPatterns: [RegExp, string][] = [
     [/şifr[ei]\w*\s*(ver|gönder|yaz|paylaş)/i,       'Kimlik bilgisi talebi tespit edildi.'],
     [/api.?key\w*\s*(ver|gönder|yaz|paylaş)/i,        'API anahtarı talebi tespit edildi.'],
@@ -98,7 +178,7 @@ function quickRiskFilter(message: string): QuickFilterResult {
   ]
 
   for (const [pattern, reason] of denyPatterns) {
-    if (pattern.test(msg)) {
+    if (pattern.test(message)) {
       return { triggered: true, score: 10, verdict: 'DENY', policy: 'POL-CHAT-DENY', reason }
     }
   }
@@ -114,7 +194,7 @@ function quickRiskFilter(message: string): QuickFilterResult {
   ]
 
   for (const [pattern, reason, score] of askPatterns) {
-    if (pattern.test(msg)) {
+    if (pattern.test(message)) {
       return { triggered: true, score, verdict: 'ASK_HUMAN', policy: 'POL-CHAT-003', reason }
     }
   }
@@ -127,27 +207,13 @@ function quickRiskFilter(message: string): QuickFilterResult {
   ]
 
   for (const pattern of mediumPatterns) {
-    if (pattern.test(msg)) {
-      return {
-        triggered: true,
-        score:     4,
-        verdict:   'PERMIT',
-        policy:    'POL-CHAT-002',
-        reason:    'Orta risk — Claude analizi gerekiyor.',
-      }
+    if (pattern.test(message)) {
+      return { triggered: true, score: 4, verdict: 'PERMIT', policy: 'POL-CHAT-002', reason: 'Orta risk — Claude analizi gerekiyor.' }
     }
   }
 
-  return {
-    triggered: false,
-    score:     2,
-    verdict:   'PERMIT',
-    policy:    'POL-CHAT-001',
-    reason:    'Düşük risk — sohbet veya okuma.',
-  }
+  return { triggered: false, score: 2, verdict: 'PERMIT', policy: 'POL-CHAT-001', reason: 'Düşük risk — sohbet veya okuma.' }
 }
-
-// ── KAT-2: Claude risk analizi ───────────────────────────────
 
 async function analyzeRiskWithClaude(
   userMessage:    string,
@@ -206,16 +272,9 @@ Karar kuralları:
 
   } catch (err: any) {
     console.warn('[scoreChatRisk] Claude analiz hatası — fail-closed ASK_HUMAN:', err.message)
-    return {
-      score:   6,
-      verdict: 'ASK_HUMAN',
-      policy:  'POL-CHAT-002',
-      reason:  'Risk analizi tamamlanamadı — güvenli tarafta kalınıyor.',
-    }
+    return { score: 6, verdict: 'ASK_HUMAN', policy: 'POL-CHAT-002', reason: 'Risk analizi tamamlanamadı — güvenli tarafta kalınıyor.' }
   }
 }
-
-// ── ANA SCORER ───────────────────────────────────────────────
 
 async function scoreChatRisk(
   userMessage:    string,
@@ -223,36 +282,23 @@ async function scoreChatRisk(
   claudeClient:   Anthropic,
 ): Promise<ChatRiskResult> {
   const quick = quickRiskFilter(userMessage)
-
-  if (quick.verdict === 'DENY') {
-    return { score: quick.score, verdict: quick.verdict, policy: quick.policy, reason: quick.reason }
-  }
-
-  if (quick.verdict === 'ASK_HUMAN' && quick.score >= 7) {
-    return { score: quick.score, verdict: quick.verdict, policy: quick.policy, reason: quick.reason }
-  }
-
-  if (quick.score >= 4) {
-    return analyzeRiskWithClaude(userMessage, assistantReply, claudeClient)
-  }
-
-  return { score: quick.score, verdict: quick.verdict, policy: quick.policy, reason: quick.reason }
+  if (quick.verdict === 'DENY') return quick
+  if (quick.verdict === 'ASK_HUMAN' && quick.score >= 7) return quick
+  if (quick.score >= 4) return analyzeRiskWithClaude(userMessage, assistantReply, claudeClient)
+  return quick
 }
 
 // ─── MEMORY YAZICI — decision (Session 18) ───────────────────
-// Amaç:    Başarılı adapter execution'larını memory_chunks'a yazar
-// Kural:   Non-critical — hata olsa response bloklenmaz
-// Edge:    project_id null ise atlanır / session_id nullable geçilir
 
 async function writeDecisionMemory(params: {
-  userId:      string
-  projectId:   string
-  sessionId:   string | null
-  category:    string
-  actionName:  string
-  bundleId:    string
-  riskLevel:   string
-  output:      unknown
+  userId:     string
+  projectId:  string
+  sessionId:  string | null
+  category:   string
+  actionName: string
+  bundleId:   string
+  riskLevel:  string
+  output:     unknown
 }): Promise<void> {
   const content = [
     `Karar: ${params.category} → ${params.actionName}`,
@@ -269,12 +315,7 @@ async function writeDecisionMemory(params: {
       session_id:  params.sessionId,
       memory_type: 'decision',
       content,
-      metadata: {
-        category:    params.category,
-        action_name: params.actionName,
-        bundle_id:   params.bundleId,
-        status:      'COMPLETED',
-      },
+      metadata: { category: params.category, action_name: params.actionName, bundle_id: params.bundleId, status: 'COMPLETED' },
     })
 
   if (error) {
@@ -282,14 +323,9 @@ async function writeDecisionMemory(params: {
   }
 }
 
-// ─── SESSION ÖZETİ PROMPT OLUŞTURUCU (Karar #89, #90) ────────
-// Amaç:    Claude'a gönderilecek session özet promptunu üretir
-// Kural:   Son 30 mesaj alınır — uzun geçmişlerde token tasarrufu
-// Edge:    Mesaj yoksa boş history ile prompt üretilir
+// ─── SESSION ÖZETİ (Karar #89, #90) ──────────────────────────
 
-function buildSummaryPrompt(
-  messages: Array<{ role: string; content: string }>
-): string {
+function buildSummaryPrompt(messages: Array<{ role: string; content: string }>): string {
   const history = messages
     .slice(-30)
     .map(m => `[${m.role.toUpperCase()}]: ${m.content}`)
@@ -321,36 +357,172 @@ Kurallar:
 - Blocker yoksa "Yok" yaz, boş bırakma`
 }
 
-// ─── SESSION ÖZETİ ÜRETİCİ (Karar #89, #90) ──────────────────
-// Amaç:    Claude'a session özeti ürettir — kullanıcı onayına sunulacak
-// Bağlı:   /api/ai/session/close endpoint'i
-// Edge:    API hatası → content boş döner, summary_error dolu gelir — frontend elle yazma sunar
-
 async function generateSessionSummary(params: {
   userId:    string
   projectId: string
   messages:  Array<{ role: string; content: string }>
 }): Promise<{ content: string; error: string | null }> {
-  const prompt = buildSummaryPrompt(params.messages)
-
   try {
     const response = await claude.messages.create({
       model:      AI_MODEL,
       max_tokens: 1500,
-      messages:   [{ role: 'user', content: prompt }],
+      messages:   [{ role: 'user', content: buildSummaryPrompt(params.messages) }],
     })
-
     const content = (response.content[0] as Anthropic.TextBlock)?.text ?? ''
     return { content, error: null }
-
   } catch (err: any) {
     console.error('[generateSessionSummary] Claude hatası:', err.message)
     return { content: '', error: err.message }
   }
 }
 
+// ─── /chat YARDIMCILARI ───────────────────────────────────────
+
+async function runSessionSetup(
+  userId:          string,
+  projectId:       string | null,
+  localMemoryPath: string | null,
+  isFirstMessage:  boolean,
+): Promise<string | null> {
+  if (isFirstMessage && projectId) {
+    const integrity = await checkIntegrity(userId, projectId, localMemoryPath)
+    await openSession(userId, projectId)
+    if (!integrity.healthy && integrity.recovered) return integrity.message
+  }
+  if (projectId) touchActivity(userId, projectId, localMemoryPath)
+  return null
+}
+
+async function buildSystemPromptWithInjection(
+  userId:          string,
+  projectId:       string | null,
+  localMemoryPath: string | null,
+): Promise<{ systemPrompt: string; proactiveInjection: Awaited<ReturnType<typeof checkAndInjectProactive>> }> {
+  const proactiveInjection = await checkAndInjectProactive(userId, projectId, localMemoryPath)
+  const systemPrompt = proactiveInjection.injected
+    ? `${SOVEREIGN_SYSTEM}\n\n${proactiveInjection.system_suffix}`
+    : SOVEREIGN_SYSTEM
+  return { systemPrompt, proactiveInjection }
+}
+
+async function callClaudeChat(
+  messages:     unknown[],
+  maxTokens:    number,
+  systemPrompt: string,
+): Promise<{ reply: string; inputTokens: number; outputTokens: number }> {
+  const response = await claude.messages.create({
+    model:      AI_MODEL,
+    max_tokens: maxTokens,
+    system:     systemPrompt,
+    messages:   messages as Anthropic.MessageParam[],
+  })
+  const rawReply = (response.content[0] as Anthropic.TextBlock)?.text ?? ''
+  return {
+    reply:        filterReply(rawReply),
+    inputTokens:  response.usage.input_tokens,
+    outputTokens: response.usage.output_tokens,
+  }
+}
+
+// ─── /apply YARDIMCILARI ──────────────────────────────────────
+
+function buildExecutionContext(userId: string, tier: string, sessionId?: string): ExecutionContext {
+  return {
+    actor_id:   userId,
+    actor_role: tier,
+    session_id: sessionId ?? `sess-${Date.now()}`,
+    bundle_id:  `bundle-${Date.now().toString(16)}`,
+    timestamp:  new Date().toISOString(),
+  }
+}
+
+async function runAdapterExecution(
+  adapterCode: string,
+  actionName:  string,
+  params:      Record<string, unknown>,
+  context:     ExecutionContext,
+): Promise<ActionResult> {
+  const FORBIDDEN_PATTERNS = [
+    'process.env', 'process.exit', 'child_process', 'require(',
+    '__dirname', '__filename', 'fs.', 'fetch(', 'axios',
+    'XMLHttpRequest', 'eval(', 'new Function(', 'global.', 'globalThis.',
+  ]
+
+  for (const pattern of FORBIDDEN_PATTERNS) {
+    if (adapterCode.includes(pattern)) {
+      throw new Error(`[R-7] Güvenlik ihlali: adapter_code yasak pattern içeriyor → "${pattern}"`)
+    }
+  }
+
+  const { createContext, Script } = await import('vm')
+  const sandboxExports: Record<string, unknown> = {}
+  const sandbox = createContext({
+    exports: sandboxExports,
+    console: {
+      log:   (...args: unknown[]) => console.log('[adapter]', ...args),
+      warn:  (...args: unknown[]) => console.warn('[adapter]', ...args),
+      error: (...args: unknown[]) => console.error('[adapter]', ...args),
+    },
+    setTimeout, clearTimeout, Promise, JSON, Math, Date, Error,
+    Array, Object, String, Number, Boolean, Map, Set,
+  })
+
+  new Script(adapterCode).runInContext(sandbox, { timeout: 3000 })
+
+  const AdapterClass = (sandboxExports['default'] ??
+    Object.values(sandboxExports)[0]) as new () => {
+      execute:          (action: string, params: Record<string, unknown>, ctx: ExecutionContext) => Promise<ActionResult>
+      validateContract: () => Promise<boolean>
+    }
+
+  if (typeof AdapterClass !== 'function') {
+    throw new Error('[R-7] adapter_code geçerli bir sınıf export etmiyor.')
+  }
+
+  const inst = new AdapterClass()
+
+  if (typeof inst.validateContract === 'function') {
+    const valid = await inst.validateContract()
+    if (!valid) throw new Error('[R-7] validateContract() false döndü — adapter yüklenemiyor.')
+  }
+
+  return inst.execute(actionName, params, context)
+}
+
+async function persistDecision(params: {
+  userId:      string
+  projectId:   string | null
+  decision:    ApplyBody['decision']
+  result:      ActionResult
+  context:     ExecutionContext
+}): Promise<void> {
+  const riskScore = params.decision.context?.risk_level === 'CRITICAL' ? 9
+                  : params.decision.context?.risk_level === 'HIGH'     ? 6
+                  : params.decision.context?.risk_level === 'MEDIUM'   ? 3
+                  : 1
+
+  const { error } = await supabase
+    .from('decisions')
+    .insert({
+      user_id:         params.userId,
+      project_id:      params.projectId ?? null,
+      decision_object: params.decision,
+      status:          params.result.success ? 'COMPLETED' : 'REJECTED',
+      risk_score:      riskScore,
+      policy_verdict:  params.result.success ? 'PERMIT' : 'DENY',
+      trace_id:        params.context.bundle_id,
+    })
+
+  if (error) {
+    console.error('[persistDecision] Supabase insert hatası:', error.message)
+  }
+}
+
 // ─── POST /api/ai/chat ────────────────────────────────────────
-router.post('/chat', async (req, res) => {
+router.post('/chat', async (req: Request, res: Response) => {
+  const validation = validateChatBody(req.body)
+  if (!validation.valid) return res.status(400).json({ error: validation.error })
+
   const {
     messages,
     max_tokens        = 1024,
@@ -358,66 +530,20 @@ router.post('/chat', async (req, res) => {
     local_memory_path = null,
     is_first_message  = false,
     session_action    = null,
-  } = req.body
-
-  if (!messages || !Array.isArray(messages)) {
-    return res.status(400).json({ error: 'messages array zorunlu' })
-  }
+  } = validation.data
 
   const userId = (req as any).user?.id ?? 'anonymous'
 
-  let integrityMessage: string | null = null
-
-  if (is_first_message && project_id) {
-    const integrity = await checkIntegrity(userId, project_id, local_memory_path)
-    if (!integrity.healthy && integrity.recovered) {
-      integrityMessage = integrity.message
-    }
-    await openSession(userId, project_id)
-  }
-
-  if (project_id) {
-    touchActivity(userId, project_id, local_memory_path)
-  }
-
   try {
-    // Karar #91: Claude çağrısından ÖNCE eşik kontrolü — proaktif enjeksiyon
-    const proactiveInjection = await checkAndInjectProactive(
-      userId,
-      project_id,
-      local_memory_path,
-    )
+    const integrityMessage = await runSessionSetup(userId, project_id, local_memory_path, is_first_message)
+    const { systemPrompt, proactiveInjection } = await buildSystemPromptWithInjection(userId, project_id, local_memory_path)
+    const { reply, inputTokens, outputTokens } = await callClaudeChat(messages, max_tokens, systemPrompt)
 
-    // Eşik aşıldıysa system prompt'a suffix ekle
-    const systemPrompt = proactiveInjection.injected
-      ? `${SOVEREIGN_SYSTEM}\n\n${proactiveInjection.system_suffix}`
-      : SOVEREIGN_SYSTEM
+    const lastUserMsg = [...messages].reverse().find(m => m.role === 'user')
+    const userText    = typeof lastUserMsg?.content === 'string' ? lastUserMsg.content : ''
+    const risk        = await scoreChatRisk(userText, reply, claude)
 
-    const response = await claude.messages.create({
-      model:      AI_MODEL,
-      max_tokens,
-      system:     systemPrompt,
-      messages,
-    })
-
-    const rawReply = (response.content[0] as Anthropic.TextBlock)?.text ?? ''
-    const reply    = filterReply(rawReply)
-
-    const lastUserMsg = [...messages].reverse().find((m: any) => m.role === 'user')
-    const userText    = typeof lastUserMsg?.content === 'string'
-      ? lastUserMsg.content
-      : ''
-
-    const risk = await scoreChatRisk(userText, reply, claude)
-
-    // Reaktif enjeksiyon — token sayacını günceller, sonraki mesaj için hazırlar
-    const reactiveInjection = await checkAndInject(
-      userId,
-      project_id,
-      local_memory_path,
-      response.usage.input_tokens,
-      response.usage.output_tokens,
-    )
+    const reactiveInjection = await checkAndInject(userId, project_id, local_memory_path, inputTokens, outputTokens)
 
     if (project_id) {
       await checkpoint(userId, project_id, {
@@ -426,9 +552,6 @@ router.post('/chat', async (req, res) => {
       }, local_memory_path)
     }
 
-    // context_refreshed: proaktif VEYA reaktif enjeksiyon tetiklendiyse true
-    const contextRefreshed = proactiveInjection.context_refreshed || reactiveInjection.context_refreshed
-
     res.json({
       reply,
       risk:              risk.score,
@@ -436,32 +559,25 @@ router.post('/chat', async (req, res) => {
       policy:            risk.policy,
       reason:            risk.reason,
       context_injected:  proactiveInjection.injected || reactiveInjection.injected,
-      context_refreshed: contextRefreshed,
+      context_refreshed: proactiveInjection.context_refreshed || reactiveInjection.context_refreshed,
       system_suffix:     proactiveInjection.injected ? proactiveInjection.system_suffix : null,
       integrity_message: integrityMessage,
     })
 
   } catch (err: any) {
-    console.error('[aiProxy] Anthropic error:', err.message)
+    console.error('[aiProxy/chat] Anthropic error:', err.message)
     res.status(500).json({ error: 'AI isteği başarısız' })
   }
 })
 
 // ─── POST /api/ai/apply ──────────────────────────────────────
-router.post('/apply', async (req, res) => {
-  if (!req.user) {
-    return res.status(401).json({ error: 'Yetkisiz' })
-  }
+router.post('/apply', async (req: Request, res: Response) => {
+  if (!req.user) return res.status(401).json({ error: 'Yetkisiz' })
 
-  const { decision } = req.body
+  const validation = validateApplyBody(req.body)
+  if (!validation.valid) return res.status(400).json({ error: validation.error })
 
-  if (!decision || typeof decision !== 'object') {
-    return res.status(400).json({ error: 'decision objesi zorunlu' })
-  }
-
-  if (!decision.category || !decision.payload?.action_name) {
-    return res.status(400).json({ error: 'decision.category ve decision.payload.action_name zorunlu' })
-  }
+  const { decision, local_memory_path = null } = validation.data
 
   try {
     const tier     = req.userTier ?? 'free'
@@ -469,104 +585,26 @@ router.post('/apply', async (req, res) => {
     const match    = matchCategory(decision.category, registry)
 
     if (!match.matched || !match.adapter) {
-      return res.json({
-        matched:  false,
-        message:  'Bu kategori için adapter tanımlı değil — sohbet olarak değerlendirildi.',
-        category: decision.category,
-      })
+      return res.json({ matched: false, message: 'Bu kategori için adapter tanımlı değil — sohbet olarak değerlendirildi.', category: decision.category })
     }
 
-    const context: ExecutionContext = {
-      actor_id:   req.user.id,
-      actor_role: tier,
-      session_id: decision.context?.session_id ?? `sess-${Date.now()}`,
-      bundle_id:  `bundle-${Date.now().toString(16)}`,
-      timestamp:  new Date().toISOString(),
-    }
+    const context = buildExecutionContext(req.user.id, tier, decision.context?.session_id)
 
     let actionResult: ActionResult
-
     try {
-      const FORBIDDEN_PATTERNS = [
-        'process.env', 'process.exit', 'child_process', 'require(',
-        '__dirname', '__filename', 'fs.', 'fetch(', 'axios',
-        'XMLHttpRequest', 'eval(', 'new Function(', 'global.', 'globalThis.',
-      ]
-
-      for (const pattern of FORBIDDEN_PATTERNS) {
-        if (match.adapter.adapter_code.includes(pattern)) {
-          throw new Error(`[R-7] Güvenlik ihlali: adapter_code yasak pattern içeriyor → "${pattern}"`)
-        }
-      }
-
-      const { createContext, Script } = await import('vm')
-
-      const sandboxExports: Record<string, unknown> = {}
-      const sandbox = createContext({
-        exports: sandboxExports,
-        console: {
-          log:   (...args: unknown[]) => console.log('[adapter]', ...args),
-          warn:  (...args: unknown[]) => console.warn('[adapter]', ...args),
-          error: (...args: unknown[]) => console.error('[adapter]', ...args),
-        },
-        setTimeout, clearTimeout, Promise, JSON, Math, Date, Error,
-        Array, Object, String, Number, Boolean, Map, Set,
-      })
-
-      const script = new Script(match.adapter.adapter_code)
-      script.runInContext(sandbox, { timeout: 3000 })
-
-      const AdapterClass = (sandboxExports.default ??
-        Object.values(sandboxExports)[0]) as new () => {
-          execute: (action: string, params: Record<string, unknown>, ctx: ExecutionContext) => Promise<ActionResult>
-          validateContract: () => Promise<boolean>
-        }
-
-      if (typeof AdapterClass !== 'function') {
-        throw new Error('[R-7] adapter_code geçerli bir sınıf export etmiyor.')
-      }
-
-      const adapterInst = new AdapterClass()
-
-      if (typeof adapterInst.validateContract === 'function') {
-        const valid = await adapterInst.validateContract()
-        if (!valid) {
-          throw new Error('[R-7] validateContract() false döndü — adapter yüklenemiyor.')
-        }
-      }
-
-      actionResult = await adapterInst.execute(
+      actionResult = await runAdapterExecution(
+        match.adapter.adapter_code,
         decision.payload.action_name,
         decision.payload.params ?? {},
         context,
       )
-
     } catch (execErr: any) {
       console.error('[aiProxy/apply] adapter.execute() hatası:', execErr.message)
       actionResult = { success: false, error: `Adapter execution hatası: ${execErr.message}` }
     }
 
-    // ── decisions tablosuna yaz ───────────────────────────────
-    const { error: dbError } = await supabase
-      .from('decisions')
-      .insert({
-        user_id:         req.user.id,
-        project_id:      decision.project_id ?? null,
-        decision_object: decision,
-        status:          actionResult.success ? 'COMPLETED' : 'REJECTED',
-        risk_score:      decision.context?.risk_level === 'CRITICAL' ? 9
-                       : decision.context?.risk_level === 'HIGH'     ? 6
-                       : decision.context?.risk_level === 'MEDIUM'   ? 3
-                       : 1,
-        policy_verdict:  actionResult.success ? 'PERMIT' : 'DENY',
-        trace_id:        context.bundle_id,
-      })
+    await persistDecision({ userId: req.user.id, projectId: decision.project_id ?? null, decision, result: actionResult, context })
 
-    if (dbError) {
-      console.error('[aiProxy/apply] Supabase decisions insert hatası:', dbError.message)
-    }
-
-    // ── memory_chunks'a yaz — sadece başarılı + project_id varsa (Session 18) ──
     if (actionResult.success && decision.project_id) {
       await writeDecisionMemory({
         userId:     req.user.id,
@@ -580,17 +618,12 @@ router.post('/apply', async (req, res) => {
       })
     }
 
-    // ── checkpoint ───────────────────────────────────────────
-    const localPath = req.body?.local_memory_path ?? null
     if (decision.project_id && actionResult.success) {
       await checkpoint(req.user.id, decision.project_id, {
         last_task:   'adapter_execution',
         last_action: `${match.category} → ${decision.payload.action_name}`,
-        custom: {
-          bundle_id: context.bundle_id,
-          category:  match.category,
-        },
-      }, localPath)
+        custom:      { bundle_id: context.bundle_id, category: match.category },
+      }, local_memory_path)
     }
 
     return res.json({
@@ -610,44 +643,23 @@ router.post('/apply', async (req, res) => {
 })
 
 // ─── POST /api/ai/session/close ──────────────────────────────
-// Amaç:    Session'ı kapat, Claude'a özet ürettir, kullanıcı onayına hazır döndür
-// Karar:   #89 (backend üretim sorumluluğu), #90 (insan sezgisi merkez)
-// Edge:    Claude hatası → summary_error dolu, content boş — frontend elle yazma sunar
-//          messages boşsa → Claude "geçmiş yok" özetiyle döner
-//          project_id eksikse → 400
+// Karar: #89, #90 — Claude özet üretir, kullanıcı onayına hazır döndürür
 
-router.post('/session/close', async (req, res) => {
+router.post('/session/close', async (req: Request, res: Response) => {
   const userId = (req as any).user?.id ?? null
+  if (!userId) return res.status(401).json({ error: 'Yetkisiz' })
 
-  if (!userId) {
-    return res.status(401).json({ error: 'Yetkisiz' })
-  }
+  const { project_id, local_memory_path = null, messages = [] } = req.body
 
-  const {
-    project_id,
-    local_memory_path = null,
-    messages          = [],
-  } = req.body
-
-  if (!project_id) {
+  if (!project_id || typeof project_id !== 'string') {
     return res.status(400).json({ error: 'project_id zorunlu' })
   }
 
   try {
     await closeSession(userId, project_id, 'normal', local_memory_path)
+    const { content, error } = await generateSessionSummary({ userId, projectId: project_id, messages })
 
-    const { content, error } = await generateSessionSummary({
-      userId,
-      projectId: project_id,
-      messages,
-    })
-
-    return res.json({
-      closed:          true,
-      project_id,
-      summary_content: content,
-      summary_error:   error,
-    })
+    return res.json({ closed: true, project_id, summary_content: content, summary_error: error })
 
   } catch (err: any) {
     console.error('[aiProxy/session/close] Hata:', err.message)
