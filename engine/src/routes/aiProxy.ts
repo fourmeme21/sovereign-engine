@@ -4,7 +4,8 @@
 // Karar:   #45 (kimlik kilidi), #52 (validateContract async), #53 (iş dili), #54 (express.d.ts),
 //          #68 (/session/close), #69 (tam merge), #77 (R-4 env abstraction), Session 18 (memory_chunks INSERT),
 //          #89 (session_index.md üretimi backend sorumluluğu), #90 (insan onayı merkezde),
-//          #91 (proaktif context enjeksiyonu — Claude çağrısından önce eşik kontrolü)
+//          #91 (proaktif context enjeksiyonu — Claude çağrısından önce eşik kontrolü),
+//          TB-12 (codeQualityGuard entegrasyonu — kod üretim isteklerinde 4 katmanlı kalite pipeline)
 // Dokunma: memory_chunks INSERT kaldırılırsa TB-2 geri açılır. scoreChatRisk hibrit engine'e dokunma.
 //          checkAndInjectProactive() sırası değiştirilemez — Claude çağrısından ÖNCE olmalı.
 //          Handler fonksiyonları 20 satır disiplinine göre bölündü — orchestrator pattern.
@@ -22,6 +23,7 @@ import {
   touchActivity,
   closeSession,
 } from '../lib/sessionManager.js'
+import { runCodeQualityGuard } from './services/codeQualityGuard.js'
 
 const router = express.Router()
 
@@ -99,7 +101,7 @@ function validateChatBody(body: unknown): { valid: true; data: ChatBody } | { va
   }
 
   if (b['max_tokens'] !== undefined && typeof b['max_tokens'] !== 'number') {
-    return { valid: false, error: 'max_tokens number olmalı' }
+    return { valid: false, error: 'max_tokens number zorunlu' }
   }
 
   return { valid: true, data: b as unknown as ChatBody }
@@ -288,6 +290,16 @@ async function scoreChatRisk(
   return quick
 }
 
+// ─── KOD ÜRETİM TETİKLEYİCİ (TB-12) ─────────────────────────
+// Amaç:    Mesajın kod üretim isteği olup olmadığını belirler
+// Edge:    Kısa mesajlar false pozitif verebilir — pattern yeterince spesifik tutuldu
+//          Türkçe + İngilizce karma mesajlar destekleniyor
+
+function isCodeGenerationRequest(message: string): boolean {
+  return /\.(ts|js|tsx|jsx|py|go|rs)\b|function\s+\w+|class\s+\w+|interface\s+\w+|implement|refactor|yaz\s+(bir\s+)?(fonksiyon|class|modül|servis|hook)|oluştur\s+(bir\s+)?(fonksiyon|class|modül|servis|hook)/i
+    .test(message)
+}
+
 // ─── MEMORY YAZICI — decision (Session 18) ───────────────────
 
 async function writeDecisionMemory(params: {
@@ -424,6 +436,43 @@ async function callClaudeChat(
   }
 }
 
+// ─── KOD KALİTE GUARD ÇAĞIRICI (TB-12) ───────────────────────
+// Amaç:    Kod üretim isteği tespit edilince 4 katmanlı kalite pipeline çalıştırır
+// Edge:    Guard hatası → orijinal reply korunur, sistem bloklanmaz
+//          escalated: true → kullanıcıya quality_warning eklenir
+
+async function applyCodeQualityGuard(
+  userText:  string,
+  reply:     string,
+): Promise<{ reply: string; qualityMeta: Record<string, unknown> | null }> {
+  if (!isCodeGenerationRequest(userText)) {
+    return { reply, qualityMeta: null }
+  }
+
+  try {
+    const guardResult = await runCodeQualityGuard({
+      client:         claude,
+      originalPrompt: userText,
+      model:          AI_MODEL,
+    })
+
+    return {
+      reply: guardResult.code || reply,
+      qualityMeta: {
+        score:      guardResult.lintResult.score,
+        maxScore:   guardResult.lintResult.maxScore,
+        passed:     guardResult.passed,
+        iterations: guardResult.iterations,
+        escalated:  guardResult.escalated,
+        summary:    guardResult.lintResult.summary,
+      },
+    }
+  } catch (err: any) {
+    console.warn('[applyCodeQualityGuard] Guard hatası — orijinal reply korunuyor:', err.message)
+    return { reply, qualityMeta: null }
+  }
+}
+
 // ─── /apply YARDIMCILARI ──────────────────────────────────────
 
 function buildExecutionContext(userId: string, tier: string, sessionId?: string): ExecutionContext {
@@ -537,11 +586,14 @@ router.post('/chat', async (req: Request, res: Response) => {
   try {
     const integrityMessage = await runSessionSetup(userId, project_id, local_memory_path, is_first_message)
     const { systemPrompt, proactiveInjection } = await buildSystemPromptWithInjection(userId, project_id, local_memory_path)
-    const { reply, inputTokens, outputTokens } = await callClaudeChat(messages, max_tokens, systemPrompt)
+    const { reply: rawReply, inputTokens, outputTokens } = await callClaudeChat(messages, max_tokens, systemPrompt)
 
     const lastUserMsg = [...messages].reverse().find(m => m.role === 'user')
     const userText    = typeof lastUserMsg?.content === 'string' ? lastUserMsg.content : ''
-    const risk        = await scoreChatRisk(userText, reply, claude)
+
+    const { reply, qualityMeta } = await applyCodeQualityGuard(userText, rawReply)
+
+    const risk = await scoreChatRisk(userText, reply, claude)
 
     const reactiveInjection = await checkAndInject(userId, project_id, local_memory_path, inputTokens, outputTokens)
 
@@ -562,6 +614,7 @@ router.post('/chat', async (req: Request, res: Response) => {
       context_refreshed: proactiveInjection.context_refreshed || reactiveInjection.context_refreshed,
       system_suffix:     proactiveInjection.injected ? proactiveInjection.system_suffix : null,
       integrity_message: integrityMessage,
+      quality:           qualityMeta,
     })
 
   } catch (err: any) {
