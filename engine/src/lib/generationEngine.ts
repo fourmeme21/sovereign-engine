@@ -52,7 +52,7 @@ import { supabase } from './supabase.js'
 
 const SESSION_TOKEN_CAPACITY      = 20_000
 const CHARS_PER_TOKEN             = 4.0
-const MODEL                       = 'claude-sonnet-4-20250514'
+const MODEL                       = process.env['AI_MODEL'] ?? 'claude-sonnet-4-5'
 const MAX_RETRIES                 = 2
 const PRICE_INPUT_PER_M           = 3.0
 const PRICE_OUTPUT_PER_M          = 15.0
