@@ -24,6 +24,10 @@
  * Session 18:
  *   writeArchitectureMemory() — generation tamamlanınca memory_chunks'a yazar
  *
+ * Karar #91 (Session 22):
+ *   Dosya döngüsünde kümülatif token sayacı — CONTEXT_REFRESH_THRESHOLD (50k)
+ *   aşılınca system prompt yenilenir, sayaç sıfırlanır.
+ *
  * Kararlar:
  *   #19: "Adapter" = projeye özel eksiksiz yürütme dokümantasyonu
  *   #20: Evrensel şablon Seçenek B — dolu referans, Claude projeye özel yazar
@@ -31,10 +35,12 @@
  *   #23: CORE + AI_AGENT → Supabase (plain text şimdilik — TODO: AES-256)
  *   #26: Generation recovery — her dosya sonrası durum kaydedilir
  *   #31: Akıllı paketleme — 20k token kapasitesi, dolunca yeni oturum
+ *   #91: Context yenileme — 50k kümülatif token eşiğinde system prompt yenilenir
  *
  * Dokunma: writeArchitectureMemory() kaldırılırsa TB-2 açılır.
  *          extractFileSummary() ve priorContext zincirine dokunma.
  *          packIntoSessions() SESSION_TOKEN_CAPACITY kilitledi — değiştirme.
+ *          CONTEXT_REFRESH_THRESHOLD değeri Karar #91 ile kilitlendi.
  */
 
 import Anthropic from '@anthropic-ai/sdk'
@@ -44,12 +50,15 @@ import { supabase } from './supabase.js'
 // SABİTLER
 // ---------------------------------------------------------------------------
 
-const SESSION_TOKEN_CAPACITY = 20_000
-const CHARS_PER_TOKEN        = 4.0
-const MODEL                  = 'claude-sonnet-4-20250514'
-const MAX_RETRIES            = 2
-const PRICE_INPUT_PER_M      = 3.0
-const PRICE_OUTPUT_PER_M     = 15.0
+const SESSION_TOKEN_CAPACITY      = 20_000
+const CHARS_PER_TOKEN             = 4.0
+const MODEL                       = 'claude-sonnet-4-20250514'
+const MAX_RETRIES                 = 2
+const PRICE_INPUT_PER_M           = 3.0
+const PRICE_OUTPUT_PER_M          = 15.0
+
+// Karar #91: Kümülatif token eşiği — aşılınca system prompt yenilenir
+const CONTEXT_REFRESH_THRESHOLD   = 50_000
 
 // ---------------------------------------------------------------------------
 // TİPLER
@@ -279,13 +288,13 @@ ${content.slice(0, 3000)}${content.length > 3000 ? '\n[...truncated...]' : ''}`,
 // ---------------------------------------------------------------------------
 
 async function writeArchitectureMemory(params: {
-  userId:       string
-  projectId:    string
-  projectName:  string
+  userId:         string
+  projectId:      string
+  projectName:    string
   completedFiles: string[]
-  failedFiles:  string[]
-  totalCostUsd: number
-  priorContext: string
+  failedFiles:    string[]
+  totalCostUsd:   number
+  priorContext:   string
 }): Promise<void> {
   const status = params.failedFiles.length > 0 ? 'partial_success' : 'completed'
 
@@ -309,7 +318,7 @@ async function writeArchitectureMemory(params: {
     .insert({
       user_id:     params.userId,
       project_id:  params.projectId,
-      session_id:  null,           // generation'da project_session yok
+      session_id:  null,
       memory_type: 'architecture',
       content,
       metadata: {
@@ -581,15 +590,15 @@ export async function runGeneration(opts: GenerationOptions): Promise<Generation
   const successFiles: string[] = [...completedFiles]
   const failedFiles:  string[] = []
   const fileCosts:    FileCost[] = []
-  let   totalCostUsd = 0
-  let   priorContext = ''
+  let   totalCostUsd  = 0
+  let   priorContext  = ''
 
   // ── Oturum döngüsü ────────────────────────────────────────────────────────
   for (let si = 0; si < sessions.length; si++) {
     const session        = sessions[si]
     const isFirstSession = si === 0 && completedFiles.length === 0
 
-    const systemPrompt = buildSystemPrompt(
+    let sessionSystemPrompt = buildSystemPrompt(
       projectName,
       masterPlan,
       priorContext,
@@ -601,12 +610,15 @@ export async function runGeneration(opts: GenerationOptions): Promise<Generation
       `${session.files.map(f => f.fileName).join(', ')}`
     )
 
+    // Karar #91: Kümülatif token sayacı — her oturum başında sıfırlanır
+    let cumulativeTokens = 0
+
     // ── Dosya döngüsü ──────────────────────────────────────────────────────
     for (const file of session.files) {
       try {
         console.log(`[generationEngine] Üretiliyor: ${file.fileName}`)
 
-        const result = await generateSingleFile(claude, projectId, file, systemPrompt)
+        const result = await generateSingleFile(claude, projectId, file, sessionSystemPrompt)
 
         const costUsd = calcCost(result.inputTokens, result.outputTokens)
         totalCostUsd += costUsd
@@ -630,6 +642,22 @@ export async function runGeneration(opts: GenerationOptions): Promise<Generation
 
         const summary = await extractFileSummary(claude, file.fileName, result.content)
         priorContext += (priorContext ? '\n\n' : '') + summary
+
+        // Karar #91: Kümülatif sayacı güncelle — eşik aşılınca system prompt yenile
+        cumulativeTokens += result.inputTokens + result.outputTokens
+        if (cumulativeTokens >= CONTEXT_REFRESH_THRESHOLD) {
+          console.log(
+            `[generationEngine] ⚠️ Context yenileniyor — ` +
+            `kümülatif token: ${cumulativeTokens} (eşik: ${CONTEXT_REFRESH_THRESHOLD})`
+          )
+          sessionSystemPrompt = buildSystemPrompt(
+            projectName,
+            masterPlan,
+            priorContext,
+            false,          // yenileme hiçbir zaman "ilk oturum" değil
+          )
+          cumulativeTokens = 0
+        }
 
         const allDefaultDone = DEFAULT_FILE_PLAN.every(f =>
           successFiles.includes(f.fileName)
