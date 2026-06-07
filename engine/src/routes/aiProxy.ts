@@ -5,7 +5,8 @@
 //          #68 (/session/close), #69 (tam merge), #77 (R-4 env abstraction), Session 18 (memory_chunks INSERT),
 //          #89 (session_index.md üretimi backend sorumluluğu), #90 (insan onayı merkezde),
 //          #91 (proaktif context enjeksiyonu — Claude çağrısından önce eşik kontrolü),
-//          TB-12 (codeQualityGuard entegrasyonu — kod üretim isteklerinde 4 katmanlı kalite pipeline)
+//          TB-12 (codeQualityGuard entegrasyonu — kod üretim isteklerinde 4 katmanlı kalite pipeline),
+//          TB-13 (zero-context judge loop — judgeVerdict qualityMeta'ya eklendi)
 // Dokunma: memory_chunks INSERT kaldırılırsa TB-2 geri açılır. scoreChatRisk hibrit engine'e dokunma.
 //          checkAndInjectProactive() sırası değiştirilemez — Claude çağrısından ÖNCE olmalı.
 //          Handler fonksiyonları 20 satır disiplinine göre bölündü — orchestrator pattern.
@@ -436,14 +437,17 @@ async function callClaudeChat(
   }
 }
 
-// ─── KOD KALİTE GUARD ÇAĞIRICI (TB-12) ───────────────────────
+// ─── KOD KALİTE GUARD ÇAĞIRICI (TB-12 / TB-13) ───────────────
 // Amaç:    Kod üretim isteği tespit edilince 4 katmanlı kalite pipeline çalıştırır
+// Bağlı:   runCodeQualityGuard() → codeQualityGuard.ts
+// Karar:   TB-12 (pipeline), TB-13 (judgeVerdict qualityMeta'ya eklendi)
 // Edge:    Guard hatası → orijinal reply korunur, sistem bloklanmaz
 //          escalated: true → kullanıcıya quality_warning eklenir
+//          judgeVerdict null olabilir — lint geçmeden judge çalışmaz
 
 async function applyCodeQualityGuard(
-  userText:  string,
-  reply:     string,
+  userText: string,
+  reply:    string,
 ): Promise<{ reply: string; qualityMeta: Record<string, unknown> | null }> {
   if (!isCodeGenerationRequest(userText)) {
     return { reply, qualityMeta: null }
@@ -459,12 +463,21 @@ async function applyCodeQualityGuard(
     return {
       reply: guardResult.code || reply,
       qualityMeta: {
-        score:      guardResult.lintResult.score,
-        maxScore:   guardResult.lintResult.maxScore,
-        passed:     guardResult.passed,
-        iterations: guardResult.iterations,
-        escalated:  guardResult.escalated,
-        summary:    guardResult.lintResult.summary,
+        score:         guardResult.lintResult.score,
+        maxScore:      guardResult.lintResult.maxScore,
+        passed:        guardResult.passed,
+        iterations:    guardResult.iterations,
+        escalated:     guardResult.escalated,
+        summary:       guardResult.lintResult.summary,
+        judge: guardResult.judgeVerdict
+          ? {
+              score:         guardResult.judgeVerdict.score,
+              confidence:    guardResult.judgeVerdict.confidence,
+              passed:        guardResult.judgeVerdict.passed,
+              failed_checks: guardResult.judgeVerdict.failed_checks,
+              todos:         guardResult.judgeVerdict.todos,
+            }
+          : null,
       },
     }
   } catch (err: any) {
