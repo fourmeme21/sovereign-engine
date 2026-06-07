@@ -23,7 +23,7 @@ import {
   touchActivity,
   closeSession,
 } from '../lib/sessionManager.js'
-import { runCodeQualityGuard } from './services/codeQualityGuard.js'
+import { runCodeQualityGuard } from '../services/codeQualityGuard.js'
 
 const router = express.Router()
 
