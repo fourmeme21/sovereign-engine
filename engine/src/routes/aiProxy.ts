@@ -3,15 +3,17 @@
 // Bağlı:   decisions tablosu, memory_chunks tablosu, project_sessions, adapterRegistry, sessionManager
 // Karar:   #45 (kimlik kilidi), #52 (validateContract async), #53 (iş dili), #54 (express.d.ts),
 //          #68 (/session/close), #69 (tam merge), #77 (R-4 env abstraction), Session 18 (memory_chunks INSERT),
-//          #89 (session_index.md üretimi backend sorumluluğu), #90 (insan onayı merkezde)
+//          #89 (session_index.md üretimi backend sorumluluğu), #90 (insan onayı merkezde),
+//          #91 (proaktif context enjeksiyonu — Claude çağrısından önce eşik kontrolü)
 // Dokunma: memory_chunks INSERT kaldırılırsa TB-2 geri açılır. scoreChatRisk hibrit engine'e dokunma.
+//          checkAndInjectProactive() sırası değiştirilemez — Claude çağrısından ÖNCE olmalı.
 
 import express from 'express'
 import Anthropic from '@anthropic-ai/sdk'
 import { supabase } from '../lib/supabase.js'
 import { loadRegistry, matchCategory } from '../lib/adapterRegistry.js'
 import type { ActionResult, ExecutionContext } from '../../../domain/template/adapter.js'
-import { checkAndInject }                                from '../lib/contextInjector.js'
+import { checkAndInject, checkAndInjectProactive } from '../lib/contextInjector.js'
 import {
   checkIntegrity,
   openSession,
@@ -379,10 +381,22 @@ router.post('/chat', async (req, res) => {
   }
 
   try {
+    // Karar #91: Claude çağrısından ÖNCE eşik kontrolü — proaktif enjeksiyon
+    const proactiveInjection = await checkAndInjectProactive(
+      userId,
+      project_id,
+      local_memory_path,
+    )
+
+    // Eşik aşıldıysa system prompt'a suffix ekle
+    const systemPrompt = proactiveInjection.injected
+      ? `${SOVEREIGN_SYSTEM}\n\n${proactiveInjection.system_suffix}`
+      : SOVEREIGN_SYSTEM
+
     const response = await claude.messages.create({
       model:      AI_MODEL,
       max_tokens,
-      system:     SOVEREIGN_SYSTEM,
+      system:     systemPrompt,
       messages,
     })
 
@@ -396,7 +410,8 @@ router.post('/chat', async (req, res) => {
 
     const risk = await scoreChatRisk(userText, reply, claude)
 
-    const injection = await checkAndInject(
+    // Reaktif enjeksiyon — token sayacını günceller, sonraki mesaj için hazırlar
+    const reactiveInjection = await checkAndInject(
       userId,
       project_id,
       local_memory_path,
@@ -411,14 +426,18 @@ router.post('/chat', async (req, res) => {
       }, local_memory_path)
     }
 
+    // context_refreshed: proaktif VEYA reaktif enjeksiyon tetiklendiyse true
+    const contextRefreshed = proactiveInjection.context_refreshed || reactiveInjection.context_refreshed
+
     res.json({
       reply,
       risk:              risk.score,
       verdict:           risk.verdict,
       policy:            risk.policy,
       reason:            risk.reason,
-      context_injected:  injection.injected,
-      system_suffix:     injection.injected ? injection.system_suffix : null,
+      context_injected:  proactiveInjection.injected || reactiveInjection.injected,
+      context_refreshed: contextRefreshed,
+      system_suffix:     proactiveInjection.injected ? proactiveInjection.system_suffix : null,
       integrity_message: integrityMessage,
     })
 
