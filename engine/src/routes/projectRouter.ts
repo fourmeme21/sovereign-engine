@@ -204,6 +204,8 @@ router.post('/create', async (req: Request, res: Response): Promise<void> => {
       { file_name: 'rollback.md',          file_order: 8,  storage_target: 'local_warm' },
       { file_name: 'session_index.md',     file_order: 9,  storage_target: 'local_hot'  },
       { file_name: 'session_log.md',       file_order: 10, storage_target: 'local_hot'  },
+      // TB-17: Adapter en son üretilir — ARCHITECTURE.md hazır olsun
+      { file_name: 'adapter.ts',           file_order: 11, storage_target: 'supabase'   },
     ]
 
     const statusRows = DEFAULT_FILES.map(f => ({
