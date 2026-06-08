@@ -233,8 +233,10 @@ Bilinen hata ve başarısızlık kalıpları ile çözümleri.
 Kritik değişiklikler için geri dönüş adımları.
 İçermeli:
   - Her değişiklik türü için rollback prosedürü
-  - Veritabanı, servis, data rollback
-  - Rollback kararı kriterleri
+  - Veritabanı rollback (migration DOWN)
+  - Servis rollback (deploy geri alma)
+  - Data rollback (backup'tan geri yükleme)
+  - Rollback kararı kriterleri (ne zaman rollback yapılır)
 `.trim(),
 
     'session_index.md': `
@@ -255,6 +257,7 @@ Boş başlangıç session log dosyası.
 `.trim(),
 
     // TB-17: vm.Script() sandbox uyumlu adapter
+    // Session 37: KATEGORİ KURALI + execute() KURALI eklendi (Risk 1 + Risk 2)
     // Dokunma: CATEGORIES XML etiketi zorunlu — extractCategoriesFromAdapter() bunu bekliyor
     //          import/require/fetch/process yasak listesi runAdapterExecution() ile senkron tutulmalı
     'adapter.ts': `
@@ -296,8 +299,20 @@ ADAPTER YAPISI (bu sırayla):
    - private metodlar (her action için ayrı, max 20 satır)
 3. exports.default = [ProjeAdi]Adapter
 
-KATEGORİLER: master plan + ARCHITECTURE.md'den çıkar.
-Her karar türü → bir kategori. Örnek: APPROVE_ORDER, CANCEL_ORDER, READ_STATUS.
+KATEGORİ KURALI:
+- READ_RESOURCE / WRITE_RESOURCE / DELETE_RESOURCE YASAK — bunlar jenerik fallback, domain kategorisi değil
+- Her kategori bu projeye özgü iş eylemi olmalı (örn: APPROVE_ORDER, CANCEL_SUBSCRIPTION, SEND_INVOICE)
+- Master plan + ARCHITECTURE.md'deki her fiil → kategori adayıdır
+- Minimum 3, maksimum 15 kategori
+- Yetersiz master plan olsa bile jenerik fallback'e geçme — elindeki bilgiyle domain'e özgü en makul kategoriyi üret
+
+execute() KURALI:
+- Bu fonksiyon Supabase'e YAZAMAZ — sandbox kısıtı
+- Görev: action'ı doğrula, params'ı kontrol et, PERMIT / DENY karar ver
+- success: true  → "bu action geçerli, aiProxy uygulasın"
+- success: false → "bu action geçersiz, sebep: [açıklama]"
+- Her case için zorunlu alan validasyonu yaz — eksik alan → false dön
+- TODO yorum YASAK — her case implement edilmiş olmalı
 
 ZORUNLU SON SATIRLAR — exports.default'tan SONRA ekle:
 // <CATEGORIES>["KATEGORİ_1","KATEGORİ_2"]</CATEGORIES>
