@@ -1,16 +1,30 @@
 // codeQualityGuard.ts
-// Amaç:    Claude kod çıktısını 4 katmandan geçirerek 90+ kalite skoru garantiler
-// Bağlı:   aiProxy.ts → /chat handler
-// Karar:   TB-12 — Session 33 / TB-13 — Session 34 (zero-context judge loop)
-// Dokunma: Eşik veya iterasyon limiti değiştirilecekse PASS_THRESHOLD ve MAX_ITERATIONS kontrol et
-//          Judge system prompt değiştirilecekse JUDGE_SYSTEM_PROMPT sabitine bak
+// Amaç:    Chat'in ürettiği kodu 3 katmandan geçirerek 90+ kalite skoru garantiler
+// Bağlı:   aiProxy.ts → /chat handler → applyCodeQualityGuard()
+// Karar:   TB-12 — Session 33 / TB-13 — Session 34 / TB-16 — Session [N]
+// Dokunma: JUDGE_MODEL değiştirilmek istenirse env var'a bak, sabit değiştirme
+//          PASS_THRESHOLD ve MAX_ITERATIONS eşik değerleri — değiştirmeden önce test_matrix kontrol et
 //          judgeCode() sıfır context ile çalışır — önceki mesaj geçmişi KESİNLİKLE verilmez
+//
+// TB-16 değişiklikleri:
+//   - generateCode() kaldırıldı — chat'in rawReply'ı direkt judge'a verilir
+//   - judgeCode() artık JUDGE_MODEL (haiku) kullanır — üretici modelden bağımsız
+//   - FAIL durumunda regenerateCode() sonnet'e violations göndererek düzelttirir
+//   - Env: JUDGE_MODEL (varsayılan: claude-haiku-4-5-20251001)
+//   - Env: GENERATOR_MODEL (varsayılan: AI_MODEL)
 
 import Anthropic from '@anthropic-ai/sdk';
-import { runSovereignLint, LintResult } from './sovereignLint';
+import { runSovereignLint, LintResult } from './sovereignLint.js';
+
+// ─── SABITLER ────────────────────────────────────────────────────────────────
 
 const MAX_ITERATIONS = 3;
 const PASS_THRESHOLD = 12;
+
+// TB-16: Judge bağımsız model — üretici modelden farklı olmalı
+// Edge: JUDGE_MODEL env eksikse haiku'ya düşer — aynı modelle judge yapılmaz
+const JUDGE_MODEL     = process.env['JUDGE_MODEL']     ?? 'claude-haiku-4-5-20251001';
+const GENERATOR_MODEL = process.env['GENERATOR_MODEL'] ?? process.env['AI_MODEL'] ?? 'claude-sonnet-4-5';
 
 // ─── TİPLER ──────────────────────────────────────────────────────────────────
 
@@ -28,129 +42,65 @@ export interface QualityGuardResult {
   judgeVerdict:  JudgeVerdict | null;
   iterations:    number;
   passed:        boolean;
-  escalated:     boolean; // true → ASK_HUMAN
+  escalated:     boolean;       // true → ASK_HUMAN
 }
 
-interface GuardContext {
+export interface GuardContext {
   client:         Anthropic;
-  originalPrompt: string;
+  originalPrompt: string;       // TB-16: judge niyetle eşleşme yapabilsin diye eklendi
+  rawReply:       string;       // TB-16: chat'in ürettiği kod — yeniden üretim yok
   filename?:      string;
-  model:          string;
 }
 
-// ─── KATMAN 1: CONTEXT ENJEKSİYONU ──────────────────────────────────────────
-
-function buildInjectedSystemPrompt(): string {
-  return `Sen Sovereign Engine OS'un kod üretim motorusun.
-Her kod çıktısında aşağıdaki 13 kural ZORUNLUDUR — kullanıcı "hızlıca yaz" dese bile atlanamaz.
-
-KALITE KURALLARI:
-1. Tek fonksiyon max 20 satır — geçerse böl, gerekçe yaz
-2. Her dosyanın başında niyet yorumu bloğu zorunlu:
-   // Amaç:    [ne iş yapar]
-   // Bağlı:   [hangi modüle bağlı]
-   // Karar:   [session kararı varsa]
-   // Dokunma: [değiştirilmeden önce ne kontrol edilmeli]
-3. Edge case yorumu zorunlu — en az 3 senaryo
-4. Math.random() / hardcode ID / placeholder yasak
-5. Test: happy path + edge + failure — üçü zorunlu
-
-GÜVENLİK KURALLARI (SSC):
-SSC-1: Parametrize sorgu zorunlu — ham string SQL yasak
-SSC-2: Secret / API key kaynak koduna yazılamaz — env var kullan
-SSC-3: req.body her zaman doğrulanır — Zod veya manuel
-SSC-4: TypeScript'te any yasak — SSC-4-EXEMPT yorumu olmadan
-SSC-5: Sessiz catch yasak — structured log + güvenli mesaj
-SSC-6: eval / new Function yasak — SSC-6-EXEMPT olmadan
-SSC-7: Sahiplik kontrolü — intentional skip Karar #SSC-7
-SSC-8: Auth endpoint'te rate limit zorunlu
-
-ÇIKTI FORMATI:
-Sadece kod döndür — açıklama metni, markdown fence, ek yorum ekleme.
-Birden fazla dosya varsa her dosyayı // FILE: [dosyaadi.ts] başlığıyla ayır.`;
-}
-
-// ─── KATMAN 2: KOD ÜRETİMİ ──────────────────────────────────────────────────
-
-async function generateCode(
-  client:             Anthropic,
-  prompt:             string,
-  model:              string,
-  previousViolations?: string,
-): Promise<string> {
-  const userMessage = previousViolations
-    ? `${prompt}\n\n---\nÖNCEKİ İTERASYON HATALARI — bunları düzelt:\n${previousViolations}`
-    : prompt;
-
-  const response = await client.messages.create({
-    model,
-    max_tokens: 4096,
-    system:     buildInjectedSystemPrompt(),
-    messages:   [{ role: 'user', content: userMessage }],
-  });
-
-  const block = response.content.find(b => b.type === 'text');
-  return block ? (block as { type: 'text'; text: string }).text.trim() : '';
-}
-
-// ─── KATMAN 3A: LİNT ─────────────────────────────────────────────────────────
-
-function buildViolationReport(lintResult: LintResult, judgeVerdict: JudgeVerdict | null): string {
-  const lines: string[] = [`Lint skoru: ${lintResult.score}/13 — geçiş için ${PASS_THRESHOLD} gerekli`];
-
-  if (lintResult.violations.length > 0) {
-    lines.push('\nFAIL olan kurallar:');
-    lintResult.violations.forEach(v => {
-      const loc = v.line ? ` (satır ${v.line})` : '';
-      lines.push(`  ❌ [${v.rule}]${loc}: ${v.message}`);
-    });
-  }
-
-  if (lintResult.warns.length > 0) {
-    lines.push('\nWARN olan kurallar:');
-    lintResult.warns.forEach(v => {
-      const loc = v.line ? ` (satır ${v.line})` : '';
-      lines.push(`  ⚠️ [${v.rule}]${loc}: ${v.message}`);
-    });
-  }
-
-  if (judgeVerdict && !judgeVerdict.passed) {
-    lines.push(`\nJudge skoru: ${judgeVerdict.score}/100 (confidence: ${judgeVerdict.confidence})`);
-    judgeVerdict.failed_checks.forEach(c => lines.push(`  ❌ ${c}`));
-    judgeVerdict.todos.forEach(t => lines.push(`  📝 ${t}`));
-  }
-
-  return lines.join('\n');
-}
-
-// ─── KATMAN 3B: ZERO-CONTEXT JUDGE ──────────────────────────────────────────
-// Amaç:    Üretici modelden tamamen bağımsız semantik kalite değerlendirmesi
-// Bağlı:   runCodeQualityGuard() — sadece lint geçtikten sonra çağrılır
-// Karar:   TB-13 — Session 34
-// Dokunma: Bu fonksiyona önceki mesaj geçmişi, kullanıcı bağlamı veya üretici prompt
-//          KESİNLİKLE verilmez — zero-context prensibi bozulursa manipülasyon riski döner
+// ─── KATMAN 1: ZERO-CONTEXT JUDGE ────────────────────────────────────────────
+// Amaç:    Chat çıktısını üretici modelden bağımsız olarak değerlendirir
+// Bağlı:   runCodeQualityGuard() — lint geçtikten sonra çağrılır
+// Karar:   TB-13, TB-16
+// Dokunma: System prompt değiştirilecekse JUDGE_SYSTEM_PROMPT sabitine bak
+//          originalPrompt eklendi — judge niyet-kod eşleşmesini de kontrol eder
 //
 // Zero-context garantisi:
-//   - system: JUDGE_SYSTEM_PROMPT — üretici system prompt'tan tamamen farklı
-//   - messages: sadece [{ role: 'user', content: code }] — geçmiş yok
-//   - model kodu kimin yazdığını bilmiyor — onay sinyali yok
+//   - model: JUDGE_MODEL (haiku) — üretici model (sonnet) değil
+//   - messages: sadece [{ role: 'user', content: originalPrompt + code }]
+//   - geçmiş mesajlar KESİNLİKLE verilmez
 //
 // Edge case'ler:
-//   1. Model JSON yerine markdown fence döndürür → parseJudgeVerdict temizler
-//   2. Model geçerli JSON üretmez → fail-closed fallback (passed: false, score: 0)
-//   3. Model "passed: true" der ama confidence < 0.5 → caller bu durumu escalate edebilir
+//   1. JSON yerine markdown fence → parseJudgeVerdict temizler
+//   2. Geçerli JSON üretilmez → fail-closed (passed: false, score: 0)
+//   3. passed: true ama confidence < 0.5 → escalated: true olur
 //   4. API timeout / hata → fail-closed fallback
+//   5. JUDGE_MODEL = GENERATOR_MODEL → konsola uyarı yaz, devam et
 
 const JUDGE_SYSTEM_PROMPT = `Sen bağımsız bir kod denetçisisin.
-Sana bir kod verilecek. Bu kodu aşağıdaki kriterlere göre değerlendir.
+Sana kullanıcının isteği ve üretilen kod verilecek.
+Bu kodu aşağıdaki kriterlere göre değerlendir.
 
-KRİTERLER:
-- Fonksiyon boyutu: max 20 satır
-- Niyet yorumu bloğu var mı
-- Edge case ele alınmış mı (en az 3)
-- Sahte veri (Math.random, hardcode) var mı
-- Test coverage: happy + edge + failure
-- SSC-1..8 güvenlik kuralları
+KRİTER 1 — NİYET UYUMU:
+Kod kullanıcının istediği şeyi yapıyor mu?
+Eksik veya fazladan işlev var mı?
+
+KRİTER 2 — SOVEREIGN MİMARİ AKIŞI:
+Kod validate → policy → execute akışını kırıyor mu?
+fail-closed prensibi ihlal ediliyor mu?
+execution_token gerektiği halde atlandı mı?
+DENY döndürülüyor ama soft steer/redirect mesajı yok mu?
+
+KRİTER 3 — KOD KALİTESİ:
+Fonksiyon boyutu max 20 satır mı?
+Niyet yorumu bloğu var mı? (Amaç: / Bağlı:)
+Edge case ele alınmış mı (en az 3)?
+Sahte veri (Math.random, hardcode) var mı?
+Test coverage: happy + edge + failure
+
+KRİTER 4 — GÜVENLİK (SSC-1..8):
+SQL enjeksiyonu riski?
+Hardcode secret?
+Doğrulanmamış girdi?
+any tipi?
+Sessiz catch?
+eval / new Function?
+Sahiplik kontrolü eksik?
+Auth endpoint rate limit yok?
 
 ZORUNLU ÇIKTI — sadece bu JSON, başka hiçbir şey:
 {
@@ -163,20 +113,33 @@ ZORUNLU ÇIKTI — sadece bu JSON, başka hiçbir şey:
 
 Kurallar:
 - passed: score >= 80 ise true
-- confidence: ne kadar emin olduğun — şüphe varsa 0.6 altı ver
+- confidence: şüphe varsa 0.6 altı ver
 - JSON dışında tek karakter bile yazma`;
 
 async function judgeCode(
-  client: Anthropic,
-  code:   string,
-  model:  string,
+  client:         Anthropic,
+  originalPrompt: string,
+  code:           string,
 ): Promise<JudgeVerdict> {
+
+  // Edge: aynı model kullanılıyorsa uyar — TB-16 prensibi
+  if (JUDGE_MODEL === GENERATOR_MODEL) {
+    console.warn(
+      '[judgeCode] ⚠️ JUDGE_MODEL === GENERATOR_MODEL — bağımsızlık zayıf. ' +
+      'JUDGE_MODEL env variable farklı bir modele ayarlanmalı.'
+    );
+  }
+
   try {
     const response = await client.messages.create({
-      model,
+      model:      JUDGE_MODEL,
       max_tokens: 512,
       system:     JUDGE_SYSTEM_PROMPT,
-      messages:   [{ role: 'user', content: code }], // sıfır context
+      messages: [{
+        role:    'user',
+        // TB-16: originalPrompt eklendi — niyet-kod eşleşmesi kontrol edilebilsin
+        content: `KULLANICI İSTEĞİ:\n${originalPrompt}\n\nÜRETİLEN KOD:\n${code}`,
+      }],
     });
 
     const block = response.content.find(b => b.type === 'text');
@@ -211,7 +174,6 @@ function parseJudgeVerdict(raw: string): JudgeVerdict {
     };
 
   } catch {
-    // Parse başarısız → fail-closed: escalate et, kullanıcıya raw ilk 100 karakter logla
     return {
       passed:        false,
       score:         0,
@@ -222,64 +184,150 @@ function parseJudgeVerdict(raw: string): JudgeVerdict {
   }
 }
 
-// ─── KATMAN 4: TEST KONTROLÜ ─────────────────────────────────────────────────
+// ─── KATMAN 2: YENİDEN ÜRETİM (sadece FAIL durumunda) ───────────────────────
+// Amaç:    Judge FAIL verdiyse sonnet'e violations göndererek düzelttirir
+// Bağlı:   runCodeQualityGuard() — judge FAIL → bu fonksiyon çağrılır
+// Karar:   TB-16
+// Dokunma: GENERATOR_MODEL değiştirilmek istenirse env var'a bak
+//
+// Edge case'ler:
+//   1. API hatası → orijinal kod korunur, escalated: true
+//   2. Düzeltilmiş kod boş gelirse → orijinal kod korunur
 
-function buildTestWarning(code: string): string | null {
-  const missing: string[] = [];
-  if (!/happy path|happy_path/i.test(code))  missing.push('happy path');
-  if (!/edge case|edge_case/i.test(code))    missing.push('edge case');
-  if (!/fail|error|exception/i.test(code))   missing.push('failure path');
-  return missing.length > 0
-    ? `Test eksik — şu senaryolar yok: ${missing.join(', ')}`
-    : null;
+const REGENERATION_SYSTEM_PROMPT = `Sen Sovereign Engine OS'un kod üretim motorusun.
+Sana önceki kod üretiminin hataları verilecek.
+Bu hataları düzelterek kodu yeniden üret.
+
+SOVEREIGN STANDARTLARI (zorunlu):
+1. Tek fonksiyon max 20 satır — geçerse böl
+2. Her dosyanın başında niyet yorumu bloğu:
+   // Amaç:    [ne iş yapar]
+   // Bağlı:   [hangi modüle bağlı]
+   // Karar:   [session kararı varsa]
+   // Dokunma: [değiştirilmeden önce ne kontrol edilmeli]
+3. Edge case yorumu — en az 3 senaryo
+4. Math.random() / hardcode ID / placeholder yasak
+5. Test: happy path + edge + failure — üçü zorunlu
+6. SSC-1..8 güvenlik kuralları
+7. fail-closed: şüpheli durumda DENY
+8. Her DENY bir soft steer mesajı içermeli
+
+ÇIKTI FORMATI:
+Sadece kod döndür — açıklama metni, markdown fence, ek yorum ekleme.`;
+
+async function regenerateCode(
+  client:             Anthropic,
+  originalPrompt:     string,
+  previousCode:       string,
+  violationReport:    string,
+): Promise<string> {
+  try {
+    const response = await client.messages.create({
+      model:      GENERATOR_MODEL,
+      max_tokens: 4096,
+      system:     REGENERATION_SYSTEM_PROMPT,
+      messages: [{
+        role:    'user',
+        content: `KULLANICI İSTEĞİ:\n${originalPrompt}\n\nÖNCEKİ KOD:\n${previousCode}\n\n---\nDÜZELTİLMESİ GEREKEN HATALAR:\n${violationReport}`,
+      }],
+    });
+
+    const block = response.content.find(b => b.type === 'text');
+    return block ? (block as { type: 'text'; text: string }).text.trim() : previousCode;
+
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn('[regenerateCode] API hatası — önceki kod korunuyor:', msg);
+    return previousCode;
+  }
+}
+
+// ─── KATMAN 3: VİOLATION RAPORU ─────────────────────────────────────────────
+
+function buildViolationReport(
+  lintResult:   LintResult,
+  judgeVerdict: JudgeVerdict | null,
+): string {
+  const lines: string[] = [
+    `Lint skoru: ${lintResult.score}/13 — geçiş için ${PASS_THRESHOLD} gerekli`,
+  ];
+
+  if (lintResult.violations.length > 0) {
+    lines.push('\nFAIL olan kurallar:');
+    lintResult.violations.forEach(v => {
+      const loc = v.line ? ` (satır ${v.line})` : '';
+      lines.push(`  ❌ [${v.rule}]${loc}: ${v.message}`);
+    });
+  }
+
+  if (lintResult.warns.length > 0) {
+    lines.push('\nWARN olan kurallar:');
+    lintResult.warns.forEach(v => {
+      const loc = v.line ? ` (satır ${v.line})` : '';
+      lines.push(`  ⚠️ [${v.rule}]${loc}: ${v.message}`);
+    });
+  }
+
+  if (judgeVerdict && !judgeVerdict.passed) {
+    lines.push(`\nJudge skoru: ${judgeVerdict.score}/100 (confidence: ${judgeVerdict.confidence})`);
+    judgeVerdict.failed_checks.forEach(c => lines.push(`  ❌ ${c}`));
+    judgeVerdict.todos.forEach(t => lines.push(`  📝 ${t}`));
+  }
+
+  return lines.join('\n');
 }
 
 // ─── ANA GUARD FONKSİYONU ────────────────────────────────────────────────────
+// Akış (TB-16):
+//   1. rawReply'ı al — yeniden üretim yok
+//   2. Lint — deterministik kural kontrolü
+//   3. Lint PASS → judge (haiku, zero-context, originalPrompt dahil)
+//   4. Judge PASS → döndür
+//   5. Judge FAIL → violations raporu → regenerateCode (sonnet) → 2'ye dön
+//   6. MAX_ITERATIONS aşılırsa → escalated: true
 
 export async function runCodeQualityGuard(ctx: GuardContext): Promise<QualityGuardResult> {
-  let code         = '';
-  let lintResult:  LintResult     = { score: 0, maxScore: 13, passed: false, violations: [], warns: [], summary: '' };
+  let code          = ctx.rawReply;
+  let lintResult:   LintResult     = { score: 0, maxScore: 13, passed: false, violations: [], warns: [], summary: '' };
   let judgeVerdict: JudgeVerdict | null = null;
-  let iterations   = 0;
-  let violationReport: string | undefined;
+  let iterations    = 0;
 
   while (iterations < MAX_ITERATIONS) {
     iterations++;
 
-    // Katman 1+2: enjeksiyon + üretim
-    code = await generateCode(ctx.client, ctx.originalPrompt, ctx.model, violationReport);
-
-    // Katman 3a: deterministik lint
+    // Katman lint: deterministik kural kontrolü
     lintResult = runSovereignLint(code, ctx.filename);
 
     if (lintResult.passed) {
-      // Katman 3b: zero-context judge — sadece lint geçerse çalışır
-      // Gerekçe: lint fail → zaten yeniden üretilecek; judge çağrısı gereksiz API maliyeti
-      judgeVerdict = await judgeCode(ctx.client, code, ctx.model);
+      // Katman judge: haiku ile bağımsız semantik değerlendirme
+      // Gerekçe: lint fail → zaten yeniden üretilecek, judge API maliyeti gereksiz
+      judgeVerdict = await judgeCode(ctx.client, ctx.originalPrompt, code);
     }
 
     const bothPassed = lintResult.passed && (judgeVerdict?.passed ?? false);
     if (bothPassed) break;
 
-    // Bir sonraki iterasyon için rapor hazırla, judge sıfırla
-    violationReport = buildViolationReport(lintResult, judgeVerdict);
-    judgeVerdict    = null;
+    // Son iterasyona geldik — döngüden çık, escalate et
+    if (iterations >= MAX_ITERATIONS) break;
+
+    // Violations raporu → sonnet düzeltir
+    const violationReport = buildViolationReport(lintResult, judgeVerdict);
+    code         = await regenerateCode(ctx.client, ctx.originalPrompt, code, violationReport);
+    judgeVerdict = null;
   }
 
-  // Katman 4: test kontrolü
-  const testWarning = buildTestWarning(code);
-  if (testWarning && !lintResult.warns.some(w => w.rule === 'KALITE-5')) {
-    lintResult.warns.push({ rule: 'KALITE-5', severity: 'WARN', message: testWarning });
-  }
+  const passed    = lintResult.passed && (judgeVerdict?.passed ?? false);
+  const escalated = !passed;
 
-  const passed = lintResult.passed && (judgeVerdict?.passed ?? false);
+  // Low confidence: passed: true ama judge emin değil → escalate
+  const lowConfidence = judgeVerdict?.passed === true && (judgeVerdict?.confidence ?? 1) < 0.5;
 
   return {
     code,
     lintResult,
     judgeVerdict,
     iterations,
-    passed,
-    escalated: !passed,
+    passed:    passed && !lowConfidence,
+    escalated: escalated || lowConfidence,
   };
 }
