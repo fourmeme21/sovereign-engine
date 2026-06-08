@@ -18,10 +18,11 @@
 // ─── TİPLER (inline — import yok) ────────────────────────────────────────────
 
 interface ExecutionContext {
-  bundle_id:    string;     // Unique işlem ID'si
-  user_id:      string;     // Kararı veren kullanıcı
-  timestamp:    string;     // ISO 8601
-  session_id?:  string;     // Aktif session ID (opsiyonel)
+  actor_id:    string;     // Kararı veren kullanıcı (buildExecutionContext → req.user.id)
+  actor_role:  string;     // Kullanıcı tier'ı (free | solo | pro | team)
+  session_id:  string;     // Aktif session ID
+  bundle_id:   string;     // Unique işlem ID'si
+  timestamp:   string;     // ISO 8601
 }
 
 interface ActionResult {
@@ -47,7 +48,7 @@ interface DomainConfig {
 //   2. validateContract() false dönerse → adapter yüklenmez
 //   3. rollback() hata fırlatırsa → log yaz, sessiz geç (best effort)
 //   4. params tip uyumsuzluğu → try/catch ile yakala, success: false
-//   5. context.user_id eksikse → sahiplik kontrolü yapılamaz → DENY
+//   5. context.actor_id eksikse → sahiplik kontrolü yapılamaz → DENY
 
 class ProjectAdapter {
   readonly name:    string = 'PROJECT_ADAPTER_NAME';  // TODO: proje adıyla değiştir
@@ -175,7 +176,7 @@ class ProjectAdapter {
   //   params:  Record<string, unknown>,
   //   context: ExecutionContext,
   // ): ActionResult {
-  //   const { product_id, quantity, owner_id } = params;
+  //   const { product_id, quantity } = params;
   //
   //   if (!product_id || typeof product_id !== 'string') {
   //     return { success: false, error: 'product_id zorunlu' };
@@ -189,7 +190,7 @@ class ProjectAdapter {
   //     id:         `order-${context.bundle_id.slice(0, 8)}`,
   //     product_id,
   //     quantity,
-  //     owner_id,
+  //     owner_id:   context.actor_id,
   //     created_at: context.timestamp,
   //     status:     'pending',
   //   };
