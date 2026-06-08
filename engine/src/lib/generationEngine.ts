@@ -37,10 +37,19 @@
  *   #31: Akıllı paketleme — 20k token kapasitesi, dolunca yeni oturum
  *   #91: Context yenileme — 50k kümülatif token eşiğinde system prompt yenilenir
  *
+ * TB-17 değişiklikleri:
+ *   DEFAULT_FILE_PLAN'a adapter.ts eklendi (fileOrder: 11)
+ *   getFileInstruction() → adapter.ts instruction eklendi (vm.Script uyumlu)
+ *   saveToSupabase() → adapter.ts dalı eklendi
+ *   extractCategoriesFromAdapter() — 3 katmanlı strateji (XML > array > kaba kuvvet)
+ *   fetchProjectMeta() — proje meta bilgisi çeker
+ *   upsertAdapter() — user_adapters upsert
+ *
  * Dokunma: writeArchitectureMemory() kaldırılırsa TB-2 açılır.
  *          extractFileSummary() ve priorContext zincirine dokunma.
  *          packIntoSessions() SESSION_TOKEN_CAPACITY kilitledi — değiştirme.
  *          CONTEXT_REFRESH_THRESHOLD değeri Karar #91 ile kilitlendi.
+ *          extractCategoriesFromAdapter() strateji sırası değiştirme — XML etiketi önce gelir.
  */
 
 import Anthropic from '@anthropic-ai/sdk'
@@ -104,6 +113,7 @@ export interface GenerationResult {
 
 // ---------------------------------------------------------------------------
 // EVRENSEL DOSYA PLANI
+// TB-17: adapter.ts eklendi — en son üretilir, ARCHITECTURE.md priorContext'te hazır olsun
 // ---------------------------------------------------------------------------
 
 const DEFAULT_FILE_PLAN: Omit<FileSpec, 'instruction'>[] = [
@@ -117,6 +127,7 @@ const DEFAULT_FILE_PLAN: Omit<FileSpec, 'instruction'>[] = [
   { fileName: 'rollback.md',         fileOrder: 8,  storageTarget: 'local_warm' },
   { fileName: 'session_index.md',    fileOrder: 9,  storageTarget: 'local_hot'  },
   { fileName: 'session_log.md',      fileOrder: 10, storageTarget: 'local_hot'  },
+  { fileName: 'adapter.ts',          fileOrder: 11, storageTarget: 'supabase'   },
 ]
 
 // ---------------------------------------------------------------------------
@@ -241,6 +252,51 @@ Boş başlangıç session log dosyası.
   - Dosya başlığı ve açıklaması
   - İlk blok: Proje oluşturuldu, generation tamamlandı bilgisi
   - CORE.md'deki Session Log Blok Formatı'na uygun tek blok
+`.trim(),
+
+    // TB-17: vm.Script() sandbox uyumlu adapter
+    // Dokunma: CATEGORIES XML etiketi zorunlu — extractCategoriesFromAdapter() bunu bekliyor
+    //          import/require/fetch/process yasak listesi runAdapterExecution() ile senkron tutulmalı
+    'adapter.ts': `
+Projeye özgü domain adapter'ı üret. Bu dosya Node.js vm.Script() sandbox'ında çalışır.
+
+ZORUNLU KURALLAR — ihlal edilirse adapter yüklenmez:
+1. import / require / fetch / process / fs / axios / eval YASAK
+2. Tamamen self-contained — dış bağımlılık yok
+3. Dosya sonu: exports.default = AdapterSınıfı (CommonJS — ESM değil)
+4. Kategori formatı: sadece büyük harf + alt çizgi (/^[A-Z_]+$/)
+5. validateContract() → categories boş olamaz, her zaman true dönmeli
+6. execute() → bilinmeyen action fail-closed: { success: false, error: '...' }
+7. Her private metod max 20 satır
+
+SANDBOX'TA KULLANILABILIR:
+console, setTimeout, clearTimeout, Promise, JSON, Math,
+Date, Error, Array, Object, String, Number, Boolean, Map, Set
+
+SANDBOX'TA YASAK:
+import, require, fetch, process.env, fs, axios,
+XMLHttpRequest, eval, new Function, global, globalThis,
+__dirname, __filename, child_process
+
+ADAPTER YAPISI (bu sırayla):
+1. Inline interface tanımları (ExecutionContext, ActionResult, DomainConfig — import yok)
+2. class [ProjeAdi]Adapter
+   - name (kebab-case, proje adından türet), version
+   - getConfig(): categories, locked_states, non_negative_fields, privileged_roles
+   - readState(actionName, params): Promise<unknown>
+   - execute(actionName, params, context): Promise<ActionResult>
+   - rollback(actionName, params, backup): Promise<void>
+   - validateContract(): Promise<boolean>
+   - private metodlar (her action için ayrı, max 20 satır)
+3. exports.default = [ProjeAdi]Adapter
+
+KATEGORİLER: master plan + ARCHITECTURE.md'den çıkar.
+Her karar türü → bir kategori. Örnek: APPROVE_ORDER, CANCEL_ORDER, READ_STATUS.
+
+ZORUNLU SON SATIRLAR — exports.default'tan SONRA ekle:
+// <CATEGORIES>["KATEGORİ_1","KATEGORİ_2"]</CATEGORIES>
+Örnek: // <CATEGORIES>["APPROVE_ORDER","CANCEL_ORDER","READ_STATUS"]</CATEGORIES>
+Bu satır olmadan adapter kaydedilemez.
 `.trim(),
   }
 
@@ -399,11 +455,12 @@ ${priorSection}
 
 ## Üretim Kuralları
 1. Her dosyayı <FILE name="DOSYA_ADI"> ... </FILE> etiketleri arasında ver
-2. Dosya içeriği Markdown formatında olmalı
+2. Dosya içeriği Markdown formatında olmalı — ISTISNA: adapter.ts TypeScript olarak üretilir
 3. Truncated çıktı yasak — her dosya tam ve eksiksiz olmalı
 4. Placeholder kullanma — gerçek içerik üret
 5. Projeye özgü ol — jenerik şablon değil, bu projeye özel içerik
-6. Master plan hangi dildeyse dosyalar da o dilde üretilir`.trim()
+6. Master plan hangi dildeyse dosyalar da o dilde üretilir
+7. adapter.ts için ek kural: geçerli TypeScript üret, yorum satırları Türkçe olabilir`.trim()
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +500,142 @@ async function markFileStatus(
 }
 
 // ---------------------------------------------------------------------------
+// TB-17: Adapter kategorilerini çıkar — 3 katmanlı strateji
+// Amaç:    Claude'un ürettiği adapter.ts'den kategori listesini güvenilir çıkarır
+// Bağlı:   saveToSupabase() → adapter.ts dalı
+// Dokunma: Strateji sırası değiştirme — XML etiketi önce gelir (instruction'da zorunlu)
+//
+// Strateji (sırayla, ilk başarılıyı kullanır):
+//   1. // <CATEGORIES>[...]</CATEGORIES> yorum satırı — instruction'da zorunlu tutulur
+//   2. categories: [...] array literal — yaygın fallback
+//   3. /^[A-Z_]{3,}$/ tüm büyük harf sabitleri — kaba kuvvet son çare
+//
+// Edge case'ler:
+//   1. XML etiketi yoksa → array literal dene
+//   2. Array literal yoksa → kaba kuvvet
+//   3. Hiçbiri bulamazsa → [] → kayıt atlanır, log yazılır
+//   4. Sistem sabitleri (TRUE, FALSE, NULL vb.) filtrelenir
+// ---------------------------------------------------------------------------
+
+function extractCategoriesFromAdapter(content: string): string[] {
+  const catPattern = /^[A-Z_]{3,}$/
+
+  // Strateji 1: // <CATEGORIES>["A","B"]</CATEGORIES> yorum satırı
+  const xmlMatch = content.match(/\/\/\s*<CATEGORIES>\s*(\[[\s\S]*?\])\s*<\/CATEGORIES>/)
+  if (xmlMatch?.[1]) {
+    try {
+      const parsed = JSON.parse(xmlMatch[1]) as unknown[]
+      const cats   = parsed.filter((c): c is string => typeof c === 'string' && catPattern.test(c))
+      if (cats.length > 0) return cats
+    } catch { /* strateji 2'ye geç */ }
+  }
+
+  // Strateji 2: categories: ['A', 'B'] array literal
+  const arrayMatch = content.match(/categories\s*:\s*\[([\s\S]*?)\]/s)
+  if (arrayMatch?.[1]) {
+    const cats: string[]   = []
+    const tokenPat         = /['"]([A-Z_]{3,})['"]/g
+    let m: RegExpExecArray | null
+    while ((m = tokenPat.exec(arrayMatch[1])) !== null) {
+      if (m[1] && catPattern.test(m[1])) cats.push(m[1])
+    }
+    if (cats.length > 0) return cats
+  }
+
+  // Strateji 3: Kaba kuvvet — tüm büyük harf sabitlerini tara
+  const SYSTEM_CONSTANTS = new Set([
+    'FORBIDDEN_PATTERNS', 'DEFAULT', 'TODO', 'CORE', 'NULL',
+    'TRUE', 'FALSE', 'NaN', 'ISO', 'UTC', 'JSON', 'WRITE',
+    'READ', 'DELETE',
+  ])
+  const allCaps: string[] = []
+  const capsPat           = /\b([A-Z_]{3,})\b/g
+  let cap: RegExpExecArray | null
+  while ((cap = capsPat.exec(content)) !== null) {
+    if (cap[1] && catPattern.test(cap[1]) && !SYSTEM_CONSTANTS.has(cap[1]) && !allCaps.includes(cap[1])) {
+      allCaps.push(cap[1])
+    }
+  }
+  return allCaps
+}
+
+// ---------------------------------------------------------------------------
+// TB-17: Proje meta bilgisini çek
+// Amaç:    adapter kaydı için user_id ve project_slug gerekli
+// Bağlı:   saveToSupabase() → adapter.ts dalı
+// Edge:    Supabase hatası veya user_id boşsa null döner → kayıt atlanır
+// ---------------------------------------------------------------------------
+
+async function fetchProjectMeta(
+  projectId: string,
+): Promise<{ userId: string; adapterName: string } | null> {
+  const { data, error } = await supabase
+    .from('user_projects')
+    .select('project_slug, user_id')
+    .eq('id', projectId)
+    .single()
+
+  if (error || !data) {
+    console.warn('[fetchProjectMeta] proje bulunamadı:', error?.message)
+    return null
+  }
+
+  const row = data as { project_slug: string; user_id: string }
+  if (!row.user_id) {
+    console.warn('[fetchProjectMeta] user_id boş — kayıt atlanıyor.')
+    return null
+  }
+
+  return {
+    userId:      row.user_id,
+    adapterName: row.project_slug ?? `adapter-${projectId.slice(0, 8)}`,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TB-17: Adapter upsert
+// Amaç:    Mevcut adapter varsa güncelle, yoksa ekle
+// Bağlı:   saveToSupabase() → adapter.ts dalı
+// Edge:    Supabase hatası → throw — generationEngine best effort yakalar
+// Dokunma: Tier limit kontrolü burada yapılmaz — generation context, registerAdapter() değil
+// ---------------------------------------------------------------------------
+
+async function upsertAdapter(
+  userId:      string,
+  adapterName: string,
+  adapterCode: string,
+  categories:  string[],
+): Promise<void> {
+  const { data: existing } = await supabase
+    .from('user_adapters')
+    .select('id')
+    .eq('user_id', userId)
+    .eq('adapter_name', adapterName)
+    .maybeSingle()
+
+  if (existing) {
+    const { error } = await supabase
+      .from('user_adapters')
+      .update({ adapter_code: adapterCode, categories, is_active: true })
+      .eq('id', (existing as { id: string }).id)
+    if (error) throw new Error(`adapter güncelleme hatası: ${error.message}`)
+    return
+  }
+
+  const { error } = await supabase
+    .from('user_adapters')
+    .insert({
+      user_id:      userId,
+      adapter_name: adapterName,
+      adapter_code: adapterCode,
+      categories,
+      version:      '1.0.0',
+      is_active:    true,
+    })
+  if (error) throw new Error(`adapter kayıt hatası: ${error.message}`)
+}
+
+// ---------------------------------------------------------------------------
 // YARDIMCI: Supabase'e dosya kaydet
 // ---------------------------------------------------------------------------
 
@@ -466,6 +659,25 @@ async function saveToSupabase(
       .update({ ai_agent_doc: content, gen_status: 'in_progress' })
       .eq('id', projectId)
     if (error) throw new Error(`ai_agent_doc yazılamadı: ${error.message}`)
+    return
+  }
+
+  // TB-17: Adapter kodu user_adapters tablosuna kaydedilir
+  // Edge 1: kategoriler çıkarılamazsa best effort — log yaz, generation devam eder
+  // Edge 2: fetchProjectMeta null dönerse kayıt atlanır
+  // Edge 3: upsertAdapter hatası → throw → generationEngine bestEffort modda yakalar
+  if (fileName === 'adapter.ts') {
+    const categories = extractCategoriesFromAdapter(content)
+    if (categories.length === 0) {
+      console.warn('[saveToSupabase] adapter.ts — kategori çıkarılamadı, kayıt atlanıyor.')
+      return
+    }
+
+    const project = await fetchProjectMeta(projectId)
+    if (!project) return
+
+    await upsertAdapter(project.userId, project.adapterName, content, categories)
+    console.log(`[saveToSupabase] adapter.ts kaydedildi — kategoriler: ${categories.join(', ')}`)
     return
   }
 }
@@ -654,7 +866,7 @@ export async function runGeneration(opts: GenerationOptions): Promise<Generation
             projectName,
             masterPlan,
             priorContext,
-            false,          // yenileme hiçbir zaman "ilk oturum" değil
+            false,
           )
           cumulativeTokens = 0
         }
@@ -718,8 +930,6 @@ export async function runGeneration(opts: GenerationOptions): Promise<Generation
   }
 
   // ── memory_chunks INSERT — architecture (Session 18) ─────────────────────
-  // Başarılı veya partial_success — her iki durumda da yazılır
-  // Failed durumda yazılmaz — priorContext boş kalır, anlamsız chunk oluşur
   if (finalStatus !== 'failed') {
     await writeArchitectureMemory({
       userId,
