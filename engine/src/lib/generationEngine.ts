@@ -280,6 +280,12 @@ __dirname, __filename, child_process
 
 ADAPTER YAPISI (bu sırayla):
 1. Inline interface tanımları (ExecutionContext, ActionResult, DomainConfig — import yok)
+   ExecutionContext alanları (bu isimler değiştirilemez — aiProxy.ts ile senkron):
+     actor_id: string    // req.user.id — sahiplik kontrolü için kullan
+     actor_role: string  // tier (free | solo | pro | team)
+     session_id: string
+     bundle_id: string
+     timestamp: string
 2. class [ProjeAdi]Adapter
    - name (kebab-case, proje adından türet), version
    - getConfig(): categories, locked_states, non_negative_fields, privileged_roles
