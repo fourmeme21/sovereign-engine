@@ -454,10 +454,12 @@ async function applyCodeQualityGuard(
   }
 
   try {
+    // TB-16: rawReply direkt judge'a — yeniden üretim yok
+    // chat'in ürettiği kod denetlenir, başka bir şey değil
     const guardResult = await runCodeQualityGuard({
       client:         claude,
       originalPrompt: userText,
-      model:          AI_MODEL,
+      rawReply:       reply,
     })
 
     return {
