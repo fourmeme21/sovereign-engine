@@ -6,10 +6,14 @@
 //          #89 (session_index.md üretimi backend sorumluluğu), #90 (insan onayı merkezde),
 //          #91 (proaktif context enjeksiyonu — Claude çağrısından önce eşik kontrolü),
 //          TB-12 (codeQualityGuard entegrasyonu — kod üretim isteklerinde 4 katmanlı kalite pipeline),
-//          TB-13 (zero-context judge loop — judgeVerdict qualityMeta'ya eklendi)
+//          TB-13 (zero-context judge loop — judgeVerdict qualityMeta'ya eklendi),
+//          TB-14 (device lock — acquire_device_lock/release_device_lock, token sayacı — increment_token_count,
+//                 50k eşiğinde core_doc+ai_agent_doc inject + reset_token_count)
 // Dokunma: memory_chunks INSERT kaldırılırsa TB-2 geri açılır. scoreChatRisk hibrit engine'e dokunma.
 //          checkAndInjectProactive() sırası değiştirilemez — Claude çağrısından ÖNCE olmalı.
 //          Handler fonksiyonları 20 satır disiplinine göre bölündü — orchestrator pattern.
+//          TB-14: injectCoreDocsIfNeeded() Claude çağrısından ÖNCE çalışmalı — sıra değiştirilemez.
+//          TB-14: releaseDeviceLock() session/close ve hata durumlarında çağrılmalı — sızıntı önlenir.
 
 import express, { Request, Response } from 'express'
 import Anthropic from '@anthropic-ai/sdk'
@@ -33,6 +37,9 @@ const claude = new Anthropic({
 })
 
 const AI_MODEL = process.env['AI_MODEL'] ?? 'claude-sonnet-4-5'
+
+// ─── TOKEN EŞİĞİ (TB-14) ─────────────────────────────────────
+const CORE_INJECT_TOKEN_THRESHOLD = 50_000
 
 // ─── KİMLİK KİLİDİ (Karar #45) ───────────────────────────────
 const SOVEREIGN_SYSTEM = `You are Sovereign AI, an intelligent decision engine.
@@ -66,12 +73,13 @@ function filterReply(reply: string): string {
 //          UUID format kontrolü — geçersiz project_id Supabase hatasına yol açar
 
 interface ChatBody {
-  messages:          Array<{ role: string; content: string }>
-  max_tokens?:       number
-  project_id?:       string | null
+  messages:           Array<{ role: string; content: string }>
+  max_tokens?:        number
+  project_id?:        string | null
   local_memory_path?: string | null
-  is_first_message?: boolean
-  session_action?:   string | null
+  is_first_message?:  boolean
+  session_action?:    string | null
+  device_id?:         string | null
 }
 
 function validateChatBody(body: unknown): { valid: true; data: ChatBody } | { valid: false; error: string } {
@@ -105,12 +113,18 @@ function validateChatBody(body: unknown): { valid: true; data: ChatBody } | { va
     return { valid: false, error: 'max_tokens number zorunlu' }
   }
 
+  if (b['device_id'] !== undefined && b['device_id'] !== null) {
+    if (typeof b['device_id'] !== 'string') {
+      return { valid: false, error: 'device_id string veya null olmalı' }
+    }
+  }
+
   return { valid: true, data: b as unknown as ChatBody }
 }
 
 interface ApplyBody {
   decision: {
-    category:   string
+    category:    string
     project_id?: string | null
     payload: {
       action_name: string
@@ -389,6 +403,158 @@ async function generateSessionSummary(params: {
   }
 }
 
+// ─── TB-14: DEVICE LOCK ───────────────────────────────────────
+// Amaç:    Aynı proje aynı anda yalnızca bir cihazdan açılabilir
+// Bağlı:   user_projects.active_device_id + device_locked_at
+// Edge:    project_id null ise kilit atlanır — device_id yoksa kilit atlanır
+//          acquire başarısız → 409 döner, chat bloklanır
+//          Supabase hatası → sessiz geçilir, sistem bloklanmaz (fail-open: kullanıcı deneyimi öncelikli)
+//          TTL: 5 dakika — acquire_device_lock() fonksiyonu DB'de yönetir
+
+async function acquireDeviceLock(
+  projectId: string,
+  userId:    string,
+  deviceId:  string,
+): Promise<{ acquired: boolean; reason?: string }> {
+  try {
+    const { data, error } = await supabase.rpc('acquire_device_lock', {
+      p_project_id: projectId,
+      p_user_id:    userId,
+      p_device_id:  deviceId,
+    })
+    if (error) throw error
+    const result = data as { acquired: boolean; reason?: string }
+    return result
+  } catch (err: any) {
+    console.warn('[acquireDeviceLock] Supabase hatası — kilit atlandı:', err.message)
+    return { acquired: true }
+  }
+}
+
+async function releaseDeviceLock(
+  projectId: string,
+  userId:    string,
+  deviceId:  string,
+): Promise<void> {
+  try {
+    await supabase.rpc('release_device_lock', {
+      p_project_id: projectId,
+      p_user_id:    userId,
+      p_device_id:  deviceId,
+    })
+  } catch (err: any) {
+    console.warn('[releaseDeviceLock] Supabase hatası:', err.message)
+  }
+}
+
+// ─── TB-14: TOKEN SAYACI ──────────────────────────────────────
+// Amaç:    Her mesaj sonrası token_count artırır, 50k geçince sıfırlar
+// Bağlı:   user_projects.token_count — increment_token_count() + reset_token_count()
+// Edge:    project_id null ise atlanır
+//          Supabase hatası → sessiz geçilir, chat bloklanmaz
+//          Dönen yeni sayaç null ise 0 kabul edilir
+
+async function incrementTokenCount(
+  projectId: string,
+  userId:    string,
+  amount:    number,
+): Promise<number> {
+  try {
+    const { data, error } = await supabase.rpc('increment_token_count', {
+      p_project_id: projectId,
+      p_user_id:    userId,
+      p_amount:     amount,
+    })
+    if (error) throw error
+    return (data as number) ?? 0
+  } catch (err: any) {
+    console.warn('[incrementTokenCount] Supabase hatası:', err.message)
+    return 0
+  }
+}
+
+async function resetTokenCount(
+  projectId: string,
+  userId:    string,
+): Promise<void> {
+  try {
+    await supabase.rpc('reset_token_count', {
+      p_project_id: projectId,
+      p_user_id:    userId,
+    })
+  } catch (err: any) {
+    console.warn('[resetTokenCount] Supabase hatası:', err.message)
+  }
+}
+
+// ─── TB-14: CORE DOC INJECT ───────────────────────────────────
+// Amaç:    token_count > 50k veya yeni session'da core_doc+ai_agent_doc system prompt'a eklenir
+// Bağlı:   user_projects.core_doc + ai_agent_doc + token_count
+// Edge:    core_doc veya ai_agent_doc null ise inject atlanır — sistem bloklanmaz
+//          project_id null ise inject atlanır
+//          Supabase hatası → sessiz geçilir, orijinal system prompt korunur
+//          Bu fonksiyon Claude çağrısından ÖNCE çalışmalı — sıra değiştirilemez
+
+interface CoreInjectResult {
+  systemPrompt:  string
+  injected:      boolean
+  tokenReset:    boolean
+}
+
+async function injectCoreDocsIfNeeded(
+  baseSystemPrompt: string,
+  projectId:        string | null,
+  userId:           string,
+  isFirstMessage:   boolean,
+): Promise<CoreInjectResult> {
+  if (!projectId) {
+    return { systemPrompt: baseSystemPrompt, injected: false, tokenReset: false }
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('user_projects')
+      .select('core_doc, ai_agent_doc, token_count')
+      .eq('id', projectId)
+      .eq('user_id', userId)
+      .single()
+
+    if (error || !data) {
+      return { systemPrompt: baseSystemPrompt, injected: false, tokenReset: false }
+    }
+
+    const row         = data as { core_doc: string | null; ai_agent_doc: string | null; token_count: number }
+    const shouldInject = isFirstMessage || row.token_count >= CORE_INJECT_TOKEN_THRESHOLD
+
+    if (!shouldInject || !row.core_doc || !row.ai_agent_doc) {
+      return { systemPrompt: baseSystemPrompt, injected: false, tokenReset: false }
+    }
+
+    const coreSuffix = [
+      '---',
+      '## PROJE CORE DOKÜMANI',
+      row.core_doc,
+      '---',
+      '## PROJE AI_AGENT DOKÜMANI',
+      row.ai_agent_doc,
+      '---',
+    ].join('\n')
+
+    const enrichedPrompt = `${baseSystemPrompt}\n\n${coreSuffix}`
+
+    const tokenReset = row.token_count >= CORE_INJECT_TOKEN_THRESHOLD
+    if (tokenReset) {
+      await resetTokenCount(projectId, userId)
+    }
+
+    return { systemPrompt: enrichedPrompt, injected: true, tokenReset }
+
+  } catch (err: any) {
+    console.warn('[injectCoreDocsIfNeeded] Supabase hatası — inject atlandı:', err.message)
+    return { systemPrompt: baseSystemPrompt, injected: false, tokenReset: false }
+  }
+}
+
 // ─── /chat YARDIMCILARI ───────────────────────────────────────
 
 async function runSessionSetup(
@@ -410,12 +576,26 @@ async function buildSystemPromptWithInjection(
   userId:          string,
   projectId:       string | null,
   localMemoryPath: string | null,
-): Promise<{ systemPrompt: string; proactiveInjection: Awaited<ReturnType<typeof checkAndInjectProactive>> }> {
+  isFirstMessage:  boolean,
+): Promise<{
+  systemPrompt:       string
+  proactiveInjection: Awaited<ReturnType<typeof checkAndInjectProactive>>
+  coreInjected:       boolean
+  tokenReset:         boolean
+}> {
   const proactiveInjection = await checkAndInjectProactive(userId, projectId, localMemoryPath)
-  const systemPrompt = proactiveInjection.injected
+  const basePrompt = proactiveInjection.injected
     ? `${SOVEREIGN_SYSTEM}\n\n${proactiveInjection.system_suffix}`
     : SOVEREIGN_SYSTEM
-  return { systemPrompt, proactiveInjection }
+
+  const coreInject = await injectCoreDocsIfNeeded(basePrompt, projectId, userId, isFirstMessage)
+
+  return {
+    systemPrompt:       coreInject.systemPrompt,
+    proactiveInjection,
+    coreInjected:       coreInject.injected,
+    tokenReset:         coreInject.tokenReset,
+  }
 }
 
 async function callClaudeChat(
@@ -454,8 +634,6 @@ async function applyCodeQualityGuard(
   }
 
   try {
-    // TB-16: rawReply direkt judge'a — yeniden üretim yok
-    // chat'in ürettiği kod denetlenir, başka bir şey değil
     const guardResult = await runCodeQualityGuard({
       client:         claude,
       originalPrompt: userText,
@@ -594,14 +772,32 @@ router.post('/chat', async (req: Request, res: Response) => {
     local_memory_path = null,
     is_first_message  = false,
     session_action    = null,
+    device_id         = null,
   } = validation.data
 
   const userId = (req as any).user?.id ?? 'anonymous'
 
+  // TB-14: Device lock — project_id ve device_id varsa kilit al
+  if (project_id && device_id) {
+    const lockResult = await acquireDeviceLock(project_id, userId, device_id)
+    if (!lockResult.acquired) {
+      return res.status(409).json({
+        error:       'Bu proje başka bir cihazdan açık.',
+        reason:      lockResult.reason ?? 'DEVICE_LOCKED',
+        retry_after: 300,
+      })
+    }
+  }
+
   try {
     const integrityMessage = await runSessionSetup(userId, project_id, local_memory_path, is_first_message)
-    const { systemPrompt, proactiveInjection } = await buildSystemPromptWithInjection(userId, project_id, local_memory_path)
-    const { reply: rawReply, inputTokens, outputTokens } = await callClaudeChat(messages, max_tokens, systemPrompt)
+
+    // TB-14: buildSystemPromptWithInjection artık is_first_message alıyor
+    const { systemPrompt, proactiveInjection, coreInjected, tokenReset } =
+      await buildSystemPromptWithInjection(userId, project_id, local_memory_path, is_first_message)
+
+    const { reply: rawReply, inputTokens, outputTokens } =
+      await callClaudeChat(messages, max_tokens, systemPrompt)
 
     const lastUserMsg = [...messages].reverse().find(m => m.role === 'user')
     const userText    = typeof lastUserMsg?.content === 'string' ? lastUserMsg.content : ''
@@ -611,6 +807,11 @@ router.post('/chat', async (req: Request, res: Response) => {
     const risk = await scoreChatRisk(userText, reply, claude)
 
     const reactiveInjection = await checkAndInject(userId, project_id, local_memory_path, inputTokens, outputTokens)
+
+    // TB-14: Token sayacını artır — toplam token (input + output)
+    if (project_id) {
+      await incrementTokenCount(project_id, userId, inputTokens + outputTokens)
+    }
 
     if (project_id) {
       await checkpoint(userId, project_id, {
@@ -630,6 +831,9 @@ router.post('/chat', async (req: Request, res: Response) => {
       system_suffix:     proactiveInjection.injected ? proactiveInjection.system_suffix : null,
       integrity_message: integrityMessage,
       quality:           qualityMeta,
+      // TB-14: core inject bilgisi — UI heartbeat için kullanılabilir
+      core_injected:     coreInjected,
+      token_reset:       tokenReset,
     })
 
   } catch (err: any) {
@@ -712,12 +916,13 @@ router.post('/apply', async (req: Request, res: Response) => {
 
 // ─── POST /api/ai/session/close ──────────────────────────────
 // Karar: #89, #90 — Claude özet üretir, kullanıcı onayına hazır döndürür
+// TB-14: session kapanışında device lock bırakılır
 
 router.post('/session/close', async (req: Request, res: Response) => {
   const userId = (req as any).user?.id ?? null
   if (!userId) return res.status(401).json({ error: 'Yetkisiz' })
 
-  const { project_id, local_memory_path = null, messages = [] } = req.body
+  const { project_id, local_memory_path = null, messages = [], device_id = null } = req.body
 
   if (!project_id || typeof project_id !== 'string') {
     return res.status(400).json({ error: 'project_id zorunlu' })
@@ -727,12 +932,77 @@ router.post('/session/close', async (req: Request, res: Response) => {
     await closeSession(userId, project_id, 'normal', local_memory_path)
     const { content, error } = await generateSessionSummary({ userId, projectId: project_id, messages })
 
+    // TB-14: Session kapanışında device lock bırak
+    if (device_id && typeof device_id === 'string') {
+      await releaseDeviceLock(project_id, userId, device_id)
+    }
+
     return res.json({ closed: true, project_id, summary_content: content, summary_error: error })
 
   } catch (err: any) {
     console.error('[aiProxy/session/close] Hata:', err.message)
+
+    // TB-14: Hata durumunda da lock bırak — sızıntı önlenir
+    if (device_id && typeof device_id === 'string') {
+      await releaseDeviceLock(project_id, userId, device_id)
+    }
+
     return res.status(500).json({ error: 'Session kapatılamadı' })
   }
+})
+
+// ─── POST /api/ai/device/release ─────────────────────────────
+// TB-14: Tarayıcı/uygulama kapanırken veya proje değiştirilirken
+//        istemci bu endpoint'i çağırarak kilidi açar.
+// Edge:  beforeunload event'i güvenilmez — TTL (5 dk) son savunma hattıdır.
+
+router.post('/device/release', async (req: Request, res: Response) => {
+  const userId = (req as any).user?.id ?? null
+  if (!userId) return res.status(401).json({ error: 'Yetkisiz' })
+
+  const { project_id, device_id } = req.body
+
+  if (!project_id || typeof project_id !== 'string') {
+    return res.status(400).json({ error: 'project_id zorunlu' })
+  }
+
+  if (!device_id || typeof device_id !== 'string') {
+    return res.status(400).json({ error: 'device_id zorunlu' })
+  }
+
+  await releaseDeviceLock(project_id, userId, device_id)
+  return res.json({ released: true, project_id })
+})
+
+// ─── POST /api/ai/device/heartbeat ───────────────────────────
+// TB-14: Aktif cihaz her 4 dakikada bir bu endpoint'i çağırarak
+//        device_locked_at'ı tazeler — TTL sıfırlanmaz, saat güncellenir.
+// Edge:  acquire_device_lock() aynı device_id için heartbeat görevi görür.
+
+router.post('/device/heartbeat', async (req: Request, res: Response) => {
+  const userId = (req as any).user?.id ?? null
+  if (!userId) return res.status(401).json({ error: 'Yetkisiz' })
+
+  const { project_id, device_id } = req.body
+
+  if (!project_id || typeof project_id !== 'string') {
+    return res.status(400).json({ error: 'project_id zorunlu' })
+  }
+
+  if (!device_id || typeof device_id !== 'string') {
+    return res.status(400).json({ error: 'device_id zorunlu' })
+  }
+
+  const result = await acquireDeviceLock(project_id, userId, device_id)
+
+  if (!result.acquired) {
+    return res.status(409).json({
+      error:  'Heartbeat başarısız — kilit başka cihazda.',
+      reason: result.reason ?? 'DEVICE_LOCKED',
+    })
+  }
+
+  return res.json({ alive: true, project_id })
 })
 
 export default router
