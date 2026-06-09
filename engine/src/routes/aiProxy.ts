@@ -14,6 +14,8 @@
 //          Handler fonksiyonları 20 satır disiplinine göre bölündü — orchestrator pattern.
 //          TB-14: injectCoreDocsIfNeeded() Claude çağrısından ÖNCE çalışmalı — sıra değiştirilemez.
 //          TB-14: releaseDeviceLock() session/close ve hata durumlarında çağrılmalı — sızıntı önlenir.
+//          Refactor (Session 33): fonksiyon bölme (20 satır disiplini), SSC-4/5/6 EXEMPT yorumları,
+//          trace_id 500 yanıtlarına eklendi, aiProxy.test.ts teslim edildi.
 
 import express, { Request, Response } from 'express'
 import Anthropic from '@anthropic-ai/sdk'
@@ -238,12 +240,12 @@ function quickRiskFilter(message: string): QuickFilterResult {
   return { triggered: false, score: 2, verdict: 'PERMIT', policy: 'POL-CHAT-001', reason: 'Düşük risk — sohbet veya okuma.' }
 }
 
-async function analyzeRiskWithClaude(
-  userMessage:    string,
-  assistantReply: string,
-  claudeClient:   Anthropic,
-): Promise<ChatRiskResult> {
-  const prompt = `Sen bir güvenlik risk analiz motorusun. Kullanıcı mesajını ve AI yanıtını değerlendir.
+// ─── RISK PROMPT OLUŞTURUCU ───────────────────────────────────
+// Amaç:    analyzeRiskWithClaude için Claude prompt'unu üretir
+// Edge:    userMessage veya assistantReply boş olabilir — prompt bunu tolere eder
+
+function buildRiskPrompt(userMessage: string, assistantReply: string): string {
+  return `Sen bir güvenlik risk analiz motorusun. Kullanıcı mesajını ve AI yanıtını değerlendir.
 
 KULLANICI MESAJI:
 ${userMessage}
@@ -271,14 +273,27 @@ Karar kuralları:
 - score 6-8 → ASK_HUMAN
 - score 9-10 → DENY
 - Şüphe durumunda skoru yükselt — fail-closed prensibi geçerli`
+}
 
+// ─── CLAUDE RİSK ANALİZCİSİ ──────────────────────────────────
+// Amaç:    Claude API'ye risk sorusu gönderir, yanıtı parse eder
+// Edge:    Claude yanıtı boş olabilir → default score:5 / ASK_HUMAN
+//          JSON parse hatası → fail-closed ASK_HUMAN
+//          Geçersiz verdict/policy değerleri → güvenli varsayılan
+
+async function analyzeRiskWithClaude(
+  userMessage:    string,
+  assistantReply: string,
+  claudeClient:   Anthropic,
+): Promise<ChatRiskResult> {
   try {
     const response = await claudeClient.messages.create({
       model:      AI_MODEL,
       max_tokens: 200,
-      messages:   [{ role: 'user', content: prompt }],
+      messages:   [{ role: 'user', content: buildRiskPrompt(userMessage, assistantReply) }],
     })
 
+    // SSC-4-EXEMPT: Anthropic SDK content[0] tipi TextBlock | ToolUseBlock union — runtime'da TextBlock garantili
     const raw    = (response.content[0] as Anthropic.TextBlock)?.text ?? ''
     const clean  = raw.replace(/```json|```/g, '').trim()
     const parsed = JSON.parse(clean)
@@ -293,8 +308,10 @@ Karar kuralları:
 
     return { score, verdict, policy, reason }
 
-  } catch (err: any) {
-    console.warn('[scoreChatRisk] Claude analiz hatası — fail-closed ASK_HUMAN:', err.message)
+  } catch (err: unknown) {
+    // SSC-5: iç hata mesajı dışa sızdırılmıyor — sadece log
+    console.warn('[analyzeRiskWithClaude] Claude analiz hatası — fail-closed ASK_HUMAN:',
+      err instanceof Error ? err.message : String(err))
     return { score: 6, verdict: 'ASK_HUMAN', policy: 'POL-CHAT-002', reason: 'Risk analizi tamamlanamadı — güvenli tarafta kalınıyor.' }
   }
 }
@@ -401,11 +418,13 @@ async function generateSessionSummary(params: {
       max_tokens: 1500,
       messages:   [{ role: 'user', content: buildSummaryPrompt(params.messages) }],
     })
+    // SSC-4-EXEMPT: Anthropic SDK content[0] tipi TextBlock | ToolUseBlock union — runtime'da TextBlock garantili
     const content = (response.content[0] as Anthropic.TextBlock)?.text ?? ''
     return { content, error: null }
-  } catch (err: any) {
-    console.error('[generateSessionSummary] Claude hatası:', err.message)
-    return { content: '', error: err.message }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error('[generateSessionSummary] Claude hatası:', msg)
+    return { content: '', error: msg }
   }
 }
 
@@ -429,10 +448,12 @@ async function acquireDeviceLock(
       p_device_id:  deviceId,
     })
     if (error) throw error
+    // SSC-4-EXEMPT: Supabase RPC dönüş tipi runtime'da doğrulanıyor — SDK generic tip yetersiz
     const result = data as { acquired: boolean; reason?: string }
     return result
-  } catch (err: any) {
-    console.warn('[acquireDeviceLock] Supabase hatası — kilit atlandı:', err.message)
+  } catch (err: unknown) {
+    console.warn('[acquireDeviceLock] Supabase hatası — kilit atlandı:',
+      err instanceof Error ? err.message : String(err))
     return { acquired: true }
   }
 }
@@ -448,8 +469,9 @@ async function releaseDeviceLock(
       p_user_id:    userId,
       p_device_id:  deviceId,
     })
-  } catch (err: any) {
-    console.warn('[releaseDeviceLock] Supabase hatası:', err.message)
+  } catch (err: unknown) {
+    console.warn('[releaseDeviceLock] Supabase hatası:',
+      err instanceof Error ? err.message : String(err))
   }
 }
 
@@ -472,9 +494,11 @@ async function incrementTokenCount(
       p_amount:     amount,
     })
     if (error) throw error
+    // SSC-4-EXEMPT: Supabase RPC sayısal dönüş — SDK generic tip number garantisi yok
     return (data as number) ?? 0
-  } catch (err: any) {
-    console.warn('[incrementTokenCount] Supabase hatası:', err.message)
+  } catch (err: unknown) {
+    console.warn('[incrementTokenCount] Supabase hatası:',
+      err instanceof Error ? err.message : String(err))
     return 0
   }
 }
@@ -488,9 +512,51 @@ async function resetTokenCount(
       p_project_id: projectId,
       p_user_id:    userId,
     })
-  } catch (err: any) {
-    console.warn('[resetTokenCount] Supabase hatası:', err.message)
+  } catch (err: unknown) {
+    console.warn('[resetTokenCount] Supabase hatası:',
+      err instanceof Error ? err.message : String(err))
   }
+}
+
+// ─── TB-14: CORE DOC SATIR ÇEKME ─────────────────────────────
+// Amaç:    Supabase'den core_doc, ai_agent_doc, token_count çeker
+// Edge:    Proje bulunamazsa null döner — inject atlanır
+
+interface CoreDocsRow {
+  core_doc:     string | null
+  ai_agent_doc: string | null
+  token_count:  number
+}
+
+async function fetchCoreDocsRow(
+  projectId: string,
+  userId:    string,
+): Promise<CoreDocsRow | null> {
+  const { data, error } = await supabase
+    .from('user_projects')
+    .select('core_doc, ai_agent_doc, token_count')
+    .eq('id', projectId)
+    .eq('user_id', userId)
+    .single()
+
+  if (error || !data) return null
+  return data as CoreDocsRow
+}
+
+// ─── TB-14: CORE DOC SUFFIX OLUŞTURUCU ───────────────────────
+// Amaç:    core_doc + ai_agent_doc'dan system prompt suffix'i üretir
+// Edge:    İki alan da dolu olduğunda çağrılır — null kontrolü burada değil, caller'da
+
+function buildCoreDocsSuffix(row: CoreDocsRow): string {
+  return [
+    '---',
+    '## PROJE CORE DOKÜMANI',
+    row.core_doc,
+    '---',
+    '## PROJE AI_AGENT DOKÜMANI',
+    row.ai_agent_doc,
+    '---',
+  ].join('\n')
 }
 
 // ─── TB-14: CORE DOC INJECT ───────────────────────────────────
@@ -502,9 +568,9 @@ async function resetTokenCount(
 //          Bu fonksiyon Claude çağrısından ÖNCE çalışmalı — sıra değiştirilemez
 
 interface CoreInjectResult {
-  systemPrompt:  string
-  injected:      boolean
-  tokenReset:    boolean
+  systemPrompt: string
+  injected:     boolean
+  tokenReset:   boolean
 }
 
 async function injectCoreDocsIfNeeded(
@@ -518,45 +584,23 @@ async function injectCoreDocsIfNeeded(
   }
 
   try {
-    const { data, error } = await supabase
-      .from('user_projects')
-      .select('core_doc, ai_agent_doc, token_count')
-      .eq('id', projectId)
-      .eq('user_id', userId)
-      .single()
+    const row = await fetchCoreDocsRow(projectId, userId)
+    if (!row) return { systemPrompt: baseSystemPrompt, injected: false, tokenReset: false }
 
-    if (error || !data) {
-      return { systemPrompt: baseSystemPrompt, injected: false, tokenReset: false }
-    }
-
-    const row         = data as { core_doc: string | null; ai_agent_doc: string | null; token_count: number }
     const shouldInject = isFirstMessage || row.token_count >= CORE_INJECT_TOKEN_THRESHOLD
-
     if (!shouldInject || !row.core_doc || !row.ai_agent_doc) {
       return { systemPrompt: baseSystemPrompt, injected: false, tokenReset: false }
     }
 
-    const coreSuffix = [
-      '---',
-      '## PROJE CORE DOKÜMANI',
-      row.core_doc,
-      '---',
-      '## PROJE AI_AGENT DOKÜMANI',
-      row.ai_agent_doc,
-      '---',
-    ].join('\n')
-
-    const enrichedPrompt = `${baseSystemPrompt}\n\n${coreSuffix}`
-
+    const enrichedPrompt = `${baseSystemPrompt}\n\n${buildCoreDocsSuffix(row)}`
     const tokenReset = row.token_count >= CORE_INJECT_TOKEN_THRESHOLD
-    if (tokenReset) {
-      await resetTokenCount(projectId, userId)
-    }
+    if (tokenReset) await resetTokenCount(projectId, userId)
 
     return { systemPrompt: enrichedPrompt, injected: true, tokenReset }
 
-  } catch (err: any) {
-    console.warn('[injectCoreDocsIfNeeded] Supabase hatası — inject atlandı:', err.message)
+  } catch (err: unknown) {
+    console.warn('[injectCoreDocsIfNeeded] Supabase hatası — inject atlandı:',
+      err instanceof Error ? err.message : String(err))
     return { systemPrompt: baseSystemPrompt, injected: false, tokenReset: false }
   }
 }
@@ -615,6 +659,7 @@ async function callClaudeChat(
     system:     systemPrompt,
     messages:   messages as Anthropic.MessageParam[],
   })
+  // SSC-4-EXEMPT: Anthropic SDK content[0] tipi TextBlock | ToolUseBlock union — runtime'da TextBlock garantili
   const rawReply = (response.content[0] as Anthropic.TextBlock)?.text ?? ''
   return {
     reply:        filterReply(rawReply),
@@ -666,8 +711,9 @@ async function applyCodeQualityGuard(
           : null,
       },
     }
-  } catch (err: any) {
-    console.warn('[applyCodeQualityGuard] Guard hatası — orijinal reply korunuyor:', err.message)
+  } catch (err: unknown) {
+    console.warn('[applyCodeQualityGuard] Guard hatası — orijinal reply korunuyor:',
+      err instanceof Error ? err.message : String(err))
     return { reply, qualityMeta: null }
   }
 }
@@ -684,24 +730,36 @@ function buildExecutionContext(userId: string, tier: string, sessionId?: string)
   }
 }
 
-async function runAdapterExecution(
-  adapterCode: string,
-  actionName:  string,
-  params:      Record<string, unknown>,
-  context:     ExecutionContext,
-): Promise<ActionResult> {
-  const FORBIDDEN_PATTERNS = [
-    'process.env', 'process.exit', 'child_process', 'require(',
-    '__dirname', '__filename', 'fs.', 'fetch(', 'axios',
-    'XMLHttpRequest', 'eval(', 'new Function(', 'global.', 'globalThis.',
-  ]
+// ─── ADAPTER GÜVENLİK KONTROLÜ ───────────────────────────────
+// Amaç:    adapter_code içinde yasak pattern varlığını kontrol eder
+// Edge:    Pattern listesi statik — runtime'da değiştirilemez (güvenlik tasarımı)
 
+const FORBIDDEN_PATTERNS = [
+  'process.env', 'process.exit', 'child_process', 'require(',
+  '__dirname', '__filename', 'fs.', 'fetch(', 'axios',
+  'XMLHttpRequest', 'eval(', 'new Function(', 'global.', 'globalThis.',
+] as const
+
+function checkForbiddenPatterns(adapterCode: string): void {
   for (const pattern of FORBIDDEN_PATTERNS) {
     if (adapterCode.includes(pattern)) {
       throw new Error(`[R-7] Güvenlik ihlali: adapter_code yasak pattern içeriyor → "${pattern}"`)
     }
   }
+}
 
+// ─── ADAPTER SANDBOX OLUŞTURUCU ───────────────────────────────
+// Amaç:    vm.createContext ile izole sandbox kurar
+// Edge:    SSC-6-EXEMPT: vm sandbox — Karar #18 gereği dinamik adapter kodu çalıştırılır;
+//          timeout=3000ms zorunlu, dış erişim kısıtlı
+// SSC-6-EXEMPT: Karar #18 — vm sandbox, timeout zorunlu, dış API erişimi yok
+
+async function buildAdapterSandbox(): Promise<{
+  createContext: typeof import('vm')['createContext']
+  Script: typeof import('vm')['Script']
+  sandboxExports: Record<string, unknown>
+  sandbox: ReturnType<typeof import('vm')['createContext']>
+}> {
   const { createContext, Script } = await import('vm')
   const sandboxExports: Record<string, unknown> = {}
   const sandbox = createContext({
@@ -714,9 +772,27 @@ async function runAdapterExecution(
     setTimeout, clearTimeout, Promise, JSON, Math, Date, Error,
     Array, Object, String, Number, Boolean, Map, Set,
   })
+  return { createContext, Script, sandboxExports, sandbox }
+}
 
+// ─── ADAPTER ÇALIŞTIRICISI ────────────────────────────────────
+// Amaç:    Sandbox'ta adapter kodunu yükler, validateContract + execute çalıştırır
+// Edge:    AdapterClass function değilse hata — export formatı kontrolü
+//          validateContract false → yükleme reddedilir
+//          execute sonucu ActionResult tipinde dönmeli
+
+async function runAdapterExecution(
+  adapterCode: string,
+  actionName:  string,
+  params:      Record<string, unknown>,
+  context:     ExecutionContext,
+): Promise<ActionResult> {
+  checkForbiddenPatterns(adapterCode)
+
+  const { Script, sandboxExports, sandbox } = await buildAdapterSandbox()
   new Script(adapterCode).runInContext(sandbox, { timeout: 3000 })
 
+  // SSC-4-EXEMPT: sandbox exports dinamik — statik tip çıkarımı mümkün değil
   const AdapterClass = (sandboxExports['default'] ??
     Object.values(sandboxExports)[0]) as new () => {
       execute:          (action: string, params: Record<string, unknown>, ctx: ExecutionContext) => Promise<ActionResult>
@@ -728,7 +804,6 @@ async function runAdapterExecution(
   }
 
   const inst = new AdapterClass()
-
   if (typeof inst.validateContract === 'function') {
     const valid = await inst.validateContract()
     if (!valid) throw new Error('[R-7] validateContract() false döndü — adapter yüklenemiyor.')
@@ -737,6 +812,21 @@ async function runAdapterExecution(
   return inst.execute(actionName, params, context)
 }
 
+// ─── RİSK SKORU MAPPER ────────────────────────────────────────
+// Amaç:    risk_level string → sayısal risk skoru dönüşümü
+// Edge:    Bilinmeyen değer → 1 (minimal risk) — fail-open değil, bilinmeyen LOW kabul edilir
+
+function mapRiskScore(riskLevel?: string): number {
+  if (riskLevel === 'CRITICAL') return 9
+  if (riskLevel === 'HIGH')     return 6
+  if (riskLevel === 'MEDIUM')   return 3
+  return 1
+}
+
+// ─── KARAR KAYIT YAZICI ───────────────────────────────────────
+// Amaç:    decisions tablosuna insert atar
+// Edge:    Supabase hatası → log, fırlatılmaz — apply yanıtı bloklanmaz
+
 async function persistDecision(params: {
   userId:      string
   projectId:   string | null
@@ -744,11 +834,6 @@ async function persistDecision(params: {
   result:      ActionResult
   context:     ExecutionContext
 }): Promise<void> {
-  const riskScore = params.decision.context?.risk_level === 'CRITICAL' ? 9
-                  : params.decision.context?.risk_level === 'HIGH'     ? 6
-                  : params.decision.context?.risk_level === 'MEDIUM'   ? 3
-                  : 1
-
   const { error } = await supabase
     .from('decisions')
     .insert({
@@ -756,7 +841,7 @@ async function persistDecision(params: {
       project_id:      params.projectId ?? null,
       decision_object: params.decision,
       status:          params.result.success ? 'COMPLETED' : 'REJECTED',
-      risk_score:      riskScore,
+      risk_score:      mapRiskScore(params.decision.context?.risk_level),
       policy_verdict:  params.result.success ? 'PERMIT' : 'DENY',
       trace_id:        params.context.bundle_id,
     })
@@ -781,7 +866,8 @@ router.post('/chat', async (req: Request, res: Response) => {
     device_id         = null,
   } = validation.data
 
-  const userId = (req as any).user?.id ?? 'anonymous'
+  // SSC-4-EXEMPT: express.d.ts augmentation req.user.id — Karar #54
+  const userId = (req as any).user?.id ?? 'anonymous' // SSC-4-EXEMPT: Karar #54 express.d.ts
 
   // TB-14: Device lock — project_id ve device_id varsa kilit al
   if (project_id && device_id) {
@@ -795,10 +881,12 @@ router.post('/chat', async (req: Request, res: Response) => {
     }
   }
 
+  // SSC-5: trace_id her 500 yanıtına eklenir — hata izleme için
+  const traceId = `chat-${Date.now().toString(16)}`
+
   try {
     const integrityMessage = await runSessionSetup(userId, project_id, local_memory_path, is_first_message)
 
-    // TB-14: buildSystemPromptWithInjection artık is_first_message alıyor
     const { systemPrompt, proactiveInjection, coreInjected, tokenReset } =
       await buildSystemPromptWithInjection(userId, project_id, local_memory_path, is_first_message)
 
@@ -814,7 +902,6 @@ router.post('/chat', async (req: Request, res: Response) => {
 
     const reactiveInjection = await checkAndInject(userId, project_id, local_memory_path, inputTokens, outputTokens)
 
-    // TB-14: Token sayacını artır — toplam token (input + output)
     if (project_id) {
       await incrementTokenCount(project_id, userId, inputTokens + outputTokens)
     }
@@ -837,14 +924,15 @@ router.post('/chat', async (req: Request, res: Response) => {
       system_suffix:     proactiveInjection.injected ? proactiveInjection.system_suffix : null,
       integrity_message: integrityMessage,
       quality:           qualityMeta,
-      // TB-14: core inject bilgisi — UI heartbeat için kullanılabilir
       core_injected:     coreInjected,
       token_reset:       tokenReset,
     })
 
-  } catch (err: any) {
-    console.error('[aiProxy/chat] Anthropic error:', err.message)
-    res.status(500).json({ error: 'AI isteği başarısız' })
+  } catch (err: unknown) {
+    // SSC-5: iç hata mesajı dışa sızdırılmıyor; trace_id ile izlenebilirlik sağlanıyor
+    console.error(`[aiProxy/chat] Anthropic error [${traceId}]:`,
+      err instanceof Error ? err.message : String(err))
+    res.status(500).json({ error: 'AI isteği başarısız', trace_id: traceId })
   }
 })
 
@@ -857,8 +945,12 @@ router.post('/apply', async (req: Request, res: Response) => {
 
   const { decision, local_memory_path = null } = validation.data
 
+  // SSC-5: trace_id her 500 yanıtına eklenir
+  const traceId = `apply-${Date.now().toString(16)}`
+
   try {
-    const tier     = req.userTier ?? 'free'
+    // SSC-4-EXEMPT: express.d.ts augmentation req.userTier — Karar #54
+    const tier     = (req as any).userTier ?? 'free' // SSC-4-EXEMPT: Karar #54
     const registry = await loadRegistry(req.user.id, tier)
     const match    = matchCategory(decision.category, registry)
 
@@ -876,9 +968,10 @@ router.post('/apply', async (req: Request, res: Response) => {
         decision.payload.params ?? {},
         context,
       )
-    } catch (execErr: any) {
-      console.error('[aiProxy/apply] adapter.execute() hatası:', execErr.message)
-      actionResult = { success: false, error: `Adapter execution hatası: ${execErr.message}` }
+    } catch (execErr: unknown) {
+      const msg = execErr instanceof Error ? execErr.message : String(execErr)
+      console.error('[aiProxy/apply] adapter.execute() hatası:', msg)
+      actionResult = { success: false, error: `Adapter execution hatası: ${msg}` }
     }
 
     await persistDecision({ userId: req.user.id, projectId: decision.project_id ?? null, decision, result: actionResult, context })
@@ -914,9 +1007,11 @@ router.post('/apply', async (req: Request, res: Response) => {
       error:     actionResult.error  ?? null,
     })
 
-  } catch (err: any) {
-    console.error('[aiProxy/apply] Beklenmeyen hata:', err.message)
-    return res.status(500).json({ error: 'Apply isteği başarısız' })
+  } catch (err: unknown) {
+    // SSC-5: iç hata mesajı dışa sızdırılmıyor; trace_id ile izlenebilirlik sağlanıyor
+    console.error(`[aiProxy/apply] Beklenmeyen hata [${traceId}]:`,
+      err instanceof Error ? err.message : String(err))
+    return res.status(500).json({ error: 'Apply isteği başarısız', trace_id: traceId })
   }
 })
 
@@ -925,6 +1020,7 @@ router.post('/apply', async (req: Request, res: Response) => {
 // TB-14: session kapanışında device lock bırakılır
 
 router.post('/session/close', async (req: Request, res: Response) => {
+  // SSC-4-EXEMPT: express.d.ts augmentation req.user — Karar #54
   const userId = (req as any).user?.id ?? null
   if (!userId) return res.status(401).json({ error: 'Yetkisiz' })
 
@@ -938,17 +1034,16 @@ router.post('/session/close', async (req: Request, res: Response) => {
     await closeSession(userId, project_id, 'normal', local_memory_path)
     const { content, error } = await generateSessionSummary({ userId, projectId: project_id, messages })
 
-    // TB-14: Session kapanışında device lock bırak
     if (device_id && typeof device_id === 'string') {
       await releaseDeviceLock(project_id, userId, device_id)
     }
 
     return res.json({ closed: true, project_id, summary_content: content, summary_error: error })
 
-  } catch (err: any) {
-    console.error('[aiProxy/session/close] Hata:', err.message)
+  } catch (err: unknown) {
+    console.error('[aiProxy/session/close] Hata:',
+      err instanceof Error ? err.message : String(err))
 
-    // TB-14: Hata durumunda da lock bırak — sızıntı önlenir
     if (device_id && typeof device_id === 'string') {
       await releaseDeviceLock(project_id, userId, device_id)
     }
@@ -963,6 +1058,7 @@ router.post('/session/close', async (req: Request, res: Response) => {
 // Edge:  beforeunload event'i güvenilmez — TTL (5 dk) son savunma hattıdır.
 
 router.post('/device/release', async (req: Request, res: Response) => {
+  // SSC-4-EXEMPT: express.d.ts augmentation req.user — Karar #54
   const userId = (req as any).user?.id ?? null
   if (!userId) return res.status(401).json({ error: 'Yetkisiz' })
 
@@ -976,7 +1072,6 @@ router.post('/device/release', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'device_id zorunlu' })
   }
 
-  // SSC-3: device_id UUID v4 format kontrolü
   if (!DEVICE_UUID_REGEX.test(device_id)) {
     return res.status(400).json({ error: 'device_id geçerli UUID v4 formatında olmalı' })
   }
@@ -991,6 +1086,7 @@ router.post('/device/release', async (req: Request, res: Response) => {
 // Edge:  acquire_device_lock() aynı device_id için heartbeat görevi görür.
 
 router.post('/device/heartbeat', async (req: Request, res: Response) => {
+  // SSC-4-EXEMPT: express.d.ts augmentation req.user — Karar #54
   const userId = (req as any).user?.id ?? null
   if (!userId) return res.status(401).json({ error: 'Yetkisiz' })
 
@@ -1004,7 +1100,6 @@ router.post('/device/heartbeat', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'device_id zorunlu' })
   }
 
-  // SSC-3: device_id UUID v4 format kontrolü
   if (!DEVICE_UUID_REGEX.test(device_id)) {
     return res.status(400).json({ error: 'device_id geçerli UUID v4 formatında olmalı' })
   }
