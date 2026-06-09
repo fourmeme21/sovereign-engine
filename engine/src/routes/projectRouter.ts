@@ -138,6 +138,87 @@ async function checkProjectLimit(userId: string, tier: string): Promise<boolean>
 }
 
 // ---------------------------------------------------------------------------
+// YARDIMCI: /create body validasyonu
+// ---------------------------------------------------------------------------
+
+function validateCreateBody(body: Record<string, unknown>): string | null {
+  const { project_name } = body
+  if (!project_name || typeof project_name !== 'string') {
+    return 'project_name zorunlu.'
+  }
+  if (project_name.trim().length < 2 || project_name.trim().length > 100) {
+    return 'project_name 2-100 karakter arasında olmalı.'
+  }
+  return null
+}
+
+// ---------------------------------------------------------------------------
+// YARDIMCI: Varsayılan generation dosya listesi + status satırları üret
+// ---------------------------------------------------------------------------
+
+function buildDefaultFiles(projectId: string): {
+  files:      GenerationFile[]
+  statusRows: object[]
+} {
+  const files: GenerationFile[] = [
+    { file_name: 'CORE.md',             file_order: 1,  storage_target: 'supabase'   },
+    { file_name: 'AI_AGENT.md',         file_order: 2,  storage_target: 'supabase'   },
+    { file_name: 'ARCHITECTURE.md',     file_order: 3,  storage_target: 'local_warm' },
+    { file_name: 'ROADMAP.md',          file_order: 4,  storage_target: 'local_warm' },
+    { file_name: 'TASK_CARDS.md',       file_order: 5,  storage_target: 'local_warm' },
+    { file_name: 'DEPENDENCIES.md',     file_order: 6,  storage_target: 'local_warm' },
+    { file_name: 'failure_patterns.md', file_order: 7,  storage_target: 'local_warm' },
+    { file_name: 'rollback.md',         file_order: 8,  storage_target: 'local_warm' },
+    { file_name: 'session_index.md',    file_order: 9,  storage_target: 'local_hot'  },
+    { file_name: 'session_log.md',      file_order: 10, storage_target: 'local_hot'  },
+    // TB-17: Adapter en son üretilir — ARCHITECTURE.md hazır olsun
+    { file_name: 'adapter.ts',          file_order: 11, storage_target: 'supabase'   },
+  ]
+  const statusRows = files.map(f => ({
+    project_id:     projectId,
+    file_name:      f.file_name,
+    file_order:     f.file_order,
+    storage_target: f.storage_target,
+    status:         'pending',
+  }))
+  return { files, statusRows }
+}
+
+// ---------------------------------------------------------------------------
+// YARDIMCI: Supabase'e proje insert et
+// ---------------------------------------------------------------------------
+
+async function insertProject(params: {
+  userId:           string
+  projectName:      string
+  slug:             string
+  masterPlan:       string | undefined
+  localMemoryPath:  string | undefined
+}): Promise<{ project: ProjectCreated | null; conflictError: boolean; triggerError: boolean }> {
+  const { data, error } = await supabase
+    .from('user_projects')
+    .insert({
+      user_id:           params.userId,
+      project_name:      params.projectName,
+      project_slug:      params.slug,
+      master_plan:       params.masterPlan ?? null,
+      gen_status:        'pending',
+      local_memory_path: params.localMemoryPath ?? null,
+    })
+    .select('id, project_name, project_slug, gen_status, created_at')
+    .single()
+
+  if (error) {
+    return {
+      project:       null,
+      conflictError: error.code === '23505',
+      triggerError:  error.code === 'P0001',
+    }
+  }
+  return { project: data as ProjectCreated, conflictError: false, triggerError: false }
+}
+
+// ---------------------------------------------------------------------------
 // ROUTER
 // ---------------------------------------------------------------------------
 
@@ -162,20 +243,17 @@ router.post('/create', async (req: Request, res: Response): Promise<void> => {
   const userId = req.user!.id
   const { project_name, master_plan, local_memory_path } = req.body
 
-  if (!project_name || typeof project_name !== 'string') {
-    res.status(400).json({ error: 'project_name zorunlu.' })
-    return
-  }
-
-  if (project_name.trim().length < 2 || project_name.trim().length > 100) {
-    res.status(400).json({ error: 'project_name 2-100 karakter arasında olmalı.' })
+  // Adım 1: Body validasyonu
+  const validationError = validateCreateBody(req.body)
+  if (validationError) {
+    res.status(400).json({ error: validationError })
     return
   }
 
   try {
+    // Adım 2: Tier limiti kontrolü
     const tier    = await getUserTier(userId)
     const allowed = await checkProjectLimit(userId, tier)
-
     if (!allowed) {
       const limit = TIER_PROJECT_LIMITS[tier] ?? 1
       res.status(403).json({
@@ -186,80 +264,49 @@ router.post('/create', async (req: Request, res: Response): Promise<void> => {
       return
     }
 
-    const slug = slugify(project_name)
+    // Adım 3: Proje insert
+    const { project, conflictError, triggerError } = await insertProject({
+      userId,
+      projectName:     project_name.trim(),
+      slug:            slugify(project_name),
+      masterPlan:      master_plan,
+      localMemoryPath: local_memory_path,
+    })
 
-    const { data: project, error: insertError } = await supabase
-      .from('user_projects')
-      .insert({
-        user_id:           userId,
-        project_name:      project_name.trim(),
-        project_slug:      slug,
-        master_plan:       master_plan ?? null,
-        gen_status:        'pending',
-        local_memory_path: local_memory_path ?? null,
-      })
-      .select('id, project_name, project_slug, gen_status, created_at')
-      .single()
-
-    if (insertError) {
-      if (insertError.code === '23505') {
-        res.status(409).json({ error: 'Bu isimde bir proje zaten var.' })
-        return
-      }
-      if (insertError.code === 'P0001') {
-        res.status(403).json({ error: 'Proje limiti aşıldı.' })
-        return
-      }
-      throw insertError
+    if (conflictError) {
+      res.status(409).json({ error: 'Bu isimde bir proje zaten var.' })
+      return
     }
+    if (triggerError) {
+      res.status(403).json({ error: 'Proje limiti aşıldı.' })
+      return
+    }
+    if (!project) throw new Error('Insert sonucu boş döndü.')
 
-    const p = project as ProjectCreated
-
-    const DEFAULT_FILES: GenerationFile[] = [
-      { file_name: 'CORE.md',              file_order: 1,  storage_target: 'supabase'   },
-      { file_name: 'AI_AGENT.md',          file_order: 2,  storage_target: 'supabase'   },
-      { file_name: 'ARCHITECTURE.md',      file_order: 3,  storage_target: 'local_warm' },
-      { file_name: 'ROADMAP.md',           file_order: 4,  storage_target: 'local_warm' },
-      { file_name: 'TASK_CARDS.md',        file_order: 5,  storage_target: 'local_warm' },
-      { file_name: 'DEPENDENCIES.md',      file_order: 6,  storage_target: 'local_warm' },
-      { file_name: 'failure_patterns.md',  file_order: 7,  storage_target: 'local_warm' },
-      { file_name: 'rollback.md',          file_order: 8,  storage_target: 'local_warm' },
-      { file_name: 'session_index.md',     file_order: 9,  storage_target: 'local_hot'  },
-      { file_name: 'session_log.md',       file_order: 10, storage_target: 'local_hot'  },
-      // TB-17: Adapter en son üretilir — ARCHITECTURE.md hazır olsun
-      { file_name: 'adapter.ts',           file_order: 11, storage_target: 'supabase'   },
-    ]
-
-    const statusRows = DEFAULT_FILES.map(f => ({
-      project_id:     p.id,
-      file_name:      f.file_name,
-      file_order:     f.file_order,
-      storage_target: f.storage_target,
-      status:         'pending',
-    }))
-
+    // Adım 4: Generation dosya planı kaydet
+    const { files, statusRows } = buildDefaultFiles(project.id)
     const { error: statusError } = await supabase
       .from('project_generation_status')
       .insert(statusRows)
-
     if (statusError) {
       console.error('[projectRouter/create] Generation status kayıt hatası:', statusError.message)
     }
 
+    // Adım 5: Yanıt gönder + generation başlat
     res.status(201).json({
-      project_id:    p.id,
-      project_name:  p.project_name,
-      project_slug:  p.project_slug,
-      gen_status:    p.gen_status,
-      created_at:    p.created_at,
-      pending_files: DEFAULT_FILES.map(f => f.file_name),
+      project_id:    project.id,
+      project_name:  project.project_name,
+      project_slug:  project.project_slug,
+      gen_status:    project.gen_status,
+      created_at:    project.created_at,
+      pending_files: files.map(f => f.file_name),
       message:       'Proje oluşturuldu. Generation arka planda başladı.',
     })
 
     if (master_plan) {
       setImmediate(() => {
         runGeneration({
-          projectId:   p.id,
+          projectId:   project.id,
           userId,
           projectName: project_name.trim(),
           masterPlan:  master_plan,
