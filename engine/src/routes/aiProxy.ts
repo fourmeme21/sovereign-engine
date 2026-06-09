@@ -82,6 +82,9 @@ interface ChatBody {
   device_id?:         string | null
 }
 
+// SSC-3: UUID v4 format doğrulaması
+const DEVICE_UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
 function validateChatBody(body: unknown): { valid: true; data: ChatBody } | { valid: false; error: string } {
   if (!body || typeof body !== 'object') {
     return { valid: false, error: 'Request body zorunlu' }
@@ -116,6 +119,9 @@ function validateChatBody(body: unknown): { valid: true; data: ChatBody } | { va
   if (b['device_id'] !== undefined && b['device_id'] !== null) {
     if (typeof b['device_id'] !== 'string') {
       return { valid: false, error: 'device_id string veya null olmalı' }
+    }
+    if (!DEVICE_UUID_REGEX.test(b['device_id'] as string)) {
+      return { valid: false, error: 'device_id geçerli UUID v4 formatında olmalı' }
     }
   }
 
@@ -970,6 +976,11 @@ router.post('/device/release', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'device_id zorunlu' })
   }
 
+  // SSC-3: device_id UUID v4 format kontrolü
+  if (!DEVICE_UUID_REGEX.test(device_id)) {
+    return res.status(400).json({ error: 'device_id geçerli UUID v4 formatında olmalı' })
+  }
+
   await releaseDeviceLock(project_id, userId, device_id)
   return res.json({ released: true, project_id })
 })
@@ -991,6 +1002,11 @@ router.post('/device/heartbeat', async (req: Request, res: Response) => {
 
   if (!device_id || typeof device_id !== 'string') {
     return res.status(400).json({ error: 'device_id zorunlu' })
+  }
+
+  // SSC-3: device_id UUID v4 format kontrolü
+  if (!DEVICE_UUID_REGEX.test(device_id)) {
+    return res.status(400).json({ error: 'device_id geçerli UUID v4 formatında olmalı' })
   }
 
   const result = await acquireDeviceLock(project_id, userId, device_id)
