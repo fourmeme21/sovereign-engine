@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 // aiProxy.test.ts
 // Amaç:    aiProxy.ts içindeki pure fonksiyonlar için birim testleri
 // Bağlı:   filterReply, validateChatBody, validateApplyBody, quickRiskFilter,
@@ -307,6 +308,34 @@ const FORBIDDEN_PATTERNS = [
   '__dirname', '__filename', 'fs.', 'fetch(', 'axios',
   'XMLHttpRequest', 'eval(', 'new Function(', 'global.', 'globalThis.',
 ] as const
+=======
+
+
+import { describe, it, expect } from 'vitest'
+
+function filterReply(reply: string): string {
+  const patterns: [RegExp, string][] = [
+    [/\bclaude\b/gi, 'Sovereign AI'],
+    [/\banthrop(?:ic)?\b/gi, 'Sovereign AI'],
+    [/\bopenai\b/gi, 'Sovereign AI'],
+    [/\bi(?:'m| am) an? (?:ai|artificial intelligence)\b/gi, 'I am Sovereign AI'],
+    [/\blanguage model\b/gi, 'decision engine'],
+    [/\blarge language\b/gi, 'decision'],
+    [/\bllm\b/gi, 'decision engine'],
+    [/\bgpt\b/gi, 'Sovereign AI'],
+  ]
+  return patterns.reduce((r, [pattern, replacement]) => r.replace(pattern, replacement), reply)
+}
+
+function mapRiskScore(riskLevel?: string): number {
+  if (riskLevel === 'CRITICAL') return 9
+  if (riskLevel === 'HIGH') return 6
+  if (riskLevel === 'MEDIUM') return 3
+  return 1
+}
+
+const FORBIDDEN_PATTERNS = ['process.env','process.exit','child_process','require(','__dirname','__filename','fs.','fetch(','axios','XMLHttpRequest','eval(','new Function(','global.','globalThis.'] as const
+>>>>>>> 472848a (test: aiProxy pure function tests — 15/15 passed)
 
 function checkForbiddenPatterns(adapterCode: string): void {
   for (const pattern of FORBIDDEN_PATTERNS) {
@@ -316,6 +345,7 @@ function checkForbiddenPatterns(adapterCode: string): void {
   }
 }
 
+<<<<<<< HEAD
 describe('checkForbiddenPatterns', () => {
   it('happy: temiz kod → hata fırlatmaz', () => {
     expect(() => checkForbiddenPatterns('const x = 1 + 2')).not.toThrow()
@@ -384,3 +414,28 @@ describe('buildCoreDocsSuffix', () => {
   })
 })
       
+=======
+describe('filterReply', () => {
+  it('claude → Sovereign AI', () => { expect(filterReply('I am Claude')).toBe('I am Sovereign AI') })
+  it('anthropic → Sovereign AI', () => { expect(filterReply('Built by Anthropic')).toBe('Built by Sovereign AI') })
+  it('language model → decision engine', () => { expect(filterReply('I am a language model')).toBe('I am a decision engine') })
+  it('CLAUDE büyük harf', () => { expect(filterReply('CLAUDE is here')).toBe('Sovereign AI is here') })
+  it('filtrelenecek kelime yok', () => { const s = 'The weather is nice.'; expect(filterReply(s)).toBe(s) })
+})
+
+describe('mapRiskScore', () => {
+  it('CRITICAL → 9', () => expect(mapRiskScore('CRITICAL')).toBe(9))
+  it('HIGH → 6', () => expect(mapRiskScore('HIGH')).toBe(6))
+  it('MEDIUM → 3', () => expect(mapRiskScore('MEDIUM')).toBe(3))
+  it('LOW → 1', () => expect(mapRiskScore('LOW')).toBe(1))
+  it('undefined → 1', () => expect(mapRiskScore(undefined)).toBe(1))
+})
+
+describe('checkForbiddenPatterns', () => {
+  it('temiz kod → hata yok', () => { expect(() => checkForbiddenPatterns('const x = 1')).not.toThrow() })
+  it('process.env → hata', () => { expect(() => checkForbiddenPatterns('process.env.KEY')).toThrow('[R-7]') })
+  it('eval( → hata', () => { expect(() => checkForbiddenPatterns('eval("x")')).toThrow('[R-7]') })
+  it('fetch( → hata', () => { expect(() => checkForbiddenPatterns('fetch("url")')).toThrow('[R-7]') })
+  it('boş string → hata yok', () => { expect(() => checkForbiddenPatterns('')).not.toThrow() })
+})
+>>>>>>> 472848a (test: aiProxy pure function tests — 15/15 passed)
