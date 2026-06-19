@@ -8,7 +8,7 @@
   },
   "scripts": {
     "type-check": "tsc --noEmit",
-    "build": "npm run type-check && tsc",
+    "build": "tsc",
     "start": "node dist/src/server/index.js",
     "dev": "node --loader ts-node/esm src/server/index.ts",
     "test": "vitest run",
