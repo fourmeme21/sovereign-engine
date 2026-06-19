@@ -10,7 +10,7 @@
 
     /* Çıktı */
     "outDir": "./dist",
-    "rootDir": "./src",
+    "rootDir": ".",
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
@@ -35,6 +35,9 @@
     /* Rust tip eşleştirme — ts-rs çıktısı için */
     "resolveJsonModule": true
   },
-  "include": ["src/**/*"],
+  "include": [
+    "src/**/*",
+    "engine/src/**/*"
+  ],
   "exclude": ["node_modules", "dist", "**/*.test.ts"]
 }
