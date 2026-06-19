@@ -1,7 +1,9 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["ES2022"],
+    "lib": [
+      "ES2022"
+    ],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "outDir": "./dist",
@@ -24,7 +26,8 @@
   },
   "include": [
     "src/**/*",
-    "engine/src/**/*"
+    "engine/src/**/*",
+    "domain/**/*"
   ],
   "exclude": [
     "node_modules",
