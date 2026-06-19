@@ -21,7 +21,6 @@ import express, { Request, Response } from 'express'
 import Anthropic from '@anthropic-ai/sdk'
 import { supabase } from '../lib/supabase.js'
 import { loadRegistry, matchCategory } from '../lib/adapterRegistry.js'
-import type { ActionResult, ExecutionContext } from '../../../domain/template/adapter.js'
 import { checkAndInject, checkAndInjectProactive } from '../lib/contextInjector.js'
 import {
   checkIntegrity,
