@@ -829,6 +829,7 @@ export async function runGeneration(opts: GenerationOptions): Promise<Generation
   // ── Oturum döngüsü ────────────────────────────────────────────────────────
   for (let si = 0; si < sessions.length; si++) {
     const session        = sessions[si]
+    if (!session) continue
     const isFirstSession = si === 0 && completedFiles.length === 0
 
     let sessionSystemPrompt = buildSystemPrompt(
@@ -976,9 +977,9 @@ export async function runGeneration(opts: GenerationOptions): Promise<Generation
     failedFiles,
     totalCostUsd,
     fileCosts,
-    error:          hasFailures
-      ? `${failedFiles.length} dosya başarısız: ${failedFiles.join(', ')}`
-      : undefined,
+    ...(hasFailures
+      ? { error: `${failedFiles.length} dosya başarısız: ${failedFiles.join(', ')}` }
+      : {}),
   }
 }
 
