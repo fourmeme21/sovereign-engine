@@ -5,7 +5,11 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "outDir": "./dist",
+<<<<<<< HEAD
     
+=======
+    "rootDir": ".",
+>>>>>>> 924713c351dca2934c50167107b329c5ba6acf6d
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
@@ -26,10 +30,14 @@
     "src/**/*",
     "engine/src/**/*"
   ],
+<<<<<<< HEAD
   "exclude": [
     "node_modules",
     "dist",
     "**/*.test.ts",
     "src/junior/**/*"
   ]
+=======
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+>>>>>>> 924713c351dca2934c50167107b329c5ba6acf6d
 }
