@@ -1,4 +1,5 @@
 // aiProxy.ts
+import { checkAndInjectProactive, checkAndInject } from '../lib/contextInjector.js';
 // Amaç:    AI chat + karar (apply) endpoint'leri — Anthropic proxy, risk skoru, session yönetimi
 // Bağlı:   decisions tablosu, memory_chunks tablosu, project_sessions, adapterRegistry, sessionManager
 // Karar:   #45 (kimlik kilidi), #52 (validateContract async), #53 (iş dili), #54 (express.d.ts),
