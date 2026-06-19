@@ -16,7 +16,7 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.24.0",
+    "@anthropic-ai/sdk": "^0.105.0",
     "@supabase/supabase-js": "^2.43.0",
     "cors": "^2.8.5",
     "dodopayments": "^1.0.0",
