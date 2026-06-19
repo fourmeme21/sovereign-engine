@@ -1,0 +1,1 @@
+{"version":3,"file":"sessionSummaryWorker.d.ts","sourceRoot":"","sources":["sessionSummaryWorker.ts"],"names":[],"mappings":"AAIA,MAAM,WAAW,mBAAmB;IAClC,SAAS,EAAE,MAAM,CAAC;IAClB,SAAS,EAAE,MAAM,CAAC;IAClB,eAAe,EAAE;QAAE,IAAI,EAAE,MAAM,GAAG,WAAW,CAAC;QAAC,OAAO,EAAE,MAAM,CAAA;KAAE,EAAE,CAAC;IACnE,WAAW,EAAE,MAAM,EAAE,CAAC;CACvB;AAED,wBAAsB,eAAe,CAAC,KAAK,EAAE,mBAAmB,iBAgD/D"}
