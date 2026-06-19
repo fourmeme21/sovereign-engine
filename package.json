@@ -9,7 +9,7 @@
   "scripts": {
     "type-check": "tsc --noEmit",
     "build": "npm run type-check && tsc",
-    "start": "node dist/server/index.js",
+    "start": "node dist/src/server/index.js",
     "dev": "node --loader ts-node/esm src/server/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -20,6 +20,7 @@
     "@supabase/supabase-js": "^2.43.0",
     "cors": "^2.8.5",
     "dodopayments": "^1.0.0",
+    "dotenv": "^17.4.2",
     "express": "^4.19.2",
     "express-rate-limit": "^8.5.2",
     "jsonwebtoken": "^9.0.2",
