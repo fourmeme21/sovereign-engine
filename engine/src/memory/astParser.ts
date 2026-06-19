@@ -56,8 +56,9 @@ export class ASTParser {
         name, body, startLine,
         endLine: startLine + body.split("\n").length,
         hasToDoFixMe: /TODO|FIXME/i.test(body),
-        imports, enclosingClass, filePath,
+        imports, filePath,
         fileModule: filePath.replace(/^.*\/src\//, "").replace(/\.[jt]sx?$/, ""),
+        ...(enclosingClass !== undefined ? { enclosingClass } : {}),
       });
       if (node.type === "class_declaration") {
         for (const child of node.children) {
