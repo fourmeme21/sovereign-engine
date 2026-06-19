@@ -5,6 +5,6 @@ export const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_KEY!,
   {
-    realtime: { transport: ws }
+    realtime: { transport: ws as any }
   }
 );
