@@ -29,7 +29,7 @@ router.post("/upload", async (req, res) => {
     );
 
     let policyResult = {
-      verdict: "PERMIT" as const,
+      verdict: "AUTO_APPROVED" as const,
       reason: "Diff üretilemedi — doğrudan upload",
       policy_id: "POL-000",
       requires_human: false,
