@@ -8,6 +8,7 @@
  *   GET    /api/project/list            → ProjectDrawer için proje listesi (TB-18)
  *   GET    /api/project                 → Kullanıcının projeleri (tam detay)
  *   GET    /api/project/:id/status      → Generation durumu (recovery)
+ *   PATCH  /api/project/:id/file/:fileName/delivered → Teslim kutusu işaretleme (TC-2)
  *   POST   /api/project/:id/file        → Tek dosya kaydet (generation adımı)
  *   DELETE /api/project/:id             → Proje sil (Supabase + lokal uyarısı)
  *   PUT    /api/project/:id/masterplan  → Master plan güncelle → fark analizi
@@ -417,7 +418,7 @@ router.get('/:id/status', async (req: Request, res: Response): Promise<void> => 
 
     const { data: files, error: filesError } = await supabase
       .from('project_generation_status')
-      .select('file_name, file_order, storage_target, status, error_message, completed_at')
+      .select('file_name, file_order, storage_target, status, error_message, completed_at, delivered')
       .eq('project_id', projectId)
       .order('file_order', { ascending: true })
 
@@ -427,6 +428,29 @@ router.get('/:id/status', async (req: Request, res: Response): Promise<void> => 
     const completed = fileList.filter(f => f.status === 'completed')
     const pending   = fileList.filter(f => f.status === 'pending')
     const failed    = fileList.filter(f => f.status === 'failed')
+
+    // TC-2 (KIRIK 2 fix): completed + henüz teslim edilmemiş (delivered=false)
+    // local_warm/local_hot dosyalarının içeriğini ayrıca taşı. Masaüstü (TC-4,
+    // sessiz polling) bunu okuyup diske yazacak, sonra /delivered ile işaretleyecek.
+    // Not: content burada sorgulanmıyor (üstteki select'te yok) — performans için
+    // ayrı bir sorguda, sadece gerçekten teslim edilecek satırlar için çekiliyor.
+    const undeliveredFiles = completed.filter(
+      f => f.storage_target !== 'supabase' && !f.delivered,
+    )
+
+    let readyForPickup: { file_name: string; content: string | null; storage_target: string }[] = []
+    if (undeliveredFiles.length > 0) {
+      const { data: contentRows, error: contentError } = await supabase
+        .from('project_generation_status')
+        .select('file_name, content, storage_target')
+        .eq('project_id', projectId)
+        .eq('status', 'completed')
+        .eq('delivered', false)
+        .neq('storage_target', 'supabase')
+
+      if (contentError) throw contentError
+      readyForPickup = contentRows ?? []
+    }
 
     let recovery_message: string | null = null
     if (p.gen_status === 'in_progress' && pending.length > 0) {
@@ -464,12 +488,77 @@ router.get('/:id/status', async (req: Request, res: Response): Promise<void> => 
       pending_files:    pending.length,
       failed_files:     failed.length,
       files:            fileList,
+      ready_for_pickup: readyForPickup,
       recovery_message,
     })
 
   } catch (err: any) {
     console.error('[projectRouter/status] Hata:', err.message)
     res.status(500).json({ error: 'Durum alınamadı.' })
+  }
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PATCH /api/project/:id/file/:fileName/delivered
+//
+// TC-2 (LOCAL_MEMORY_CHAIN_REPORT) — Teslim kutusu işaretleme endpoint'i.
+// Masaüstü (TC-4, sessiz polling), /:id/status'tan aldığı ready_for_pickup
+// içeriğini diske (StorageManager) yazdıktan SONRA bu endpoint'i çağırır.
+// Amaç: aynı içeriğin tekrar tekrar poll edilip taşınmasını önlemek.
+//
+// Not: fileName URL path param'ı içinde geldiği için (örn. "ROADMAP.md")
+// encodeURIComponent ile gönderilmesi beklenir; burada decode edilir.
+// ═══════════════════════════════════════════════════════════════════════════
+
+router.patch('/:id/file/:fileName/delivered', async (req: Request, res: Response): Promise<void> => {
+  const userId    = req.user!.id
+  const projectId = req.params.id
+  const fileName  = decodeURIComponent(req.params.fileName)
+
+  // SSC-3: UUID formatı doğrula
+  if (!isValidUuid(projectId)) {
+    res.status(400).json({ error: 'Geçersiz proje ID formatı.' })
+    return
+  }
+
+  if (!fileName) {
+    res.status(400).json({ error: 'fileName zorunlu.' })
+    return
+  }
+
+  try {
+    // Projenin bu kullanıcıya ait olduğunu doğrula (cross-user yazma engeli)
+    const { data: project, error: projError } = await supabase
+      .from('user_projects')
+      .select('id')
+      .eq('id', projectId)
+      .eq('user_id', userId)
+      .single()
+
+    if (projError || !project) {
+      res.status(404).json({ error: 'Proje bulunamadı.' })
+      return
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('project_generation_status')
+      .update({ delivered: true })
+      .eq('project_id', projectId)
+      .eq('file_name',  fileName)
+      .eq('status',     'completed')
+      .select('file_name, delivered')
+      .single()
+
+    if (updateError || !updated) {
+      res.status(404).json({ error: 'Dosya kaydı bulunamadı veya henüz tamamlanmamış.' })
+      return
+    }
+
+    res.json({ file_name: updated.file_name, delivered: updated.delivered })
+
+  } catch (err: any) {
+    console.error('[projectRouter/delivered] Hata:', err.message)
+    res.status(500).json({ error: 'Teslim işaretlenemedi.' })
   }
 })
 
