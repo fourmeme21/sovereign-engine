@@ -138,6 +138,8 @@ const ALLOWED_ORIGINS = [
   process.env['ALLOWED_ORIGIN'],
   'http://localhost:5173',
   'http://localhost:4173',
+  'http://tauri.localhost',
+  'https://tauri.localhost',
 ].filter(Boolean) as string[]
 
 // Fix: Vercel preview URL'leri dinamik subdomain üretir — pattern matching gerekli
@@ -328,3 +330,4 @@ setInterval(() => {
     console.error('[Keep-Alive] Ping hatası:', err.message)
   })
 }, 10 * 60 * 1000)
+  
