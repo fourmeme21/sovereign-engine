@@ -508,14 +508,26 @@ async function markFileStatus(
   fileName:  string,
   status:    'completed' | 'failed',
   errorMsg?: string,
+  content?:  string,
 ): Promise<void> {
+  // TC-2 (LOCAL_MEMORY_CHAIN_REPORT, KIRIK 2 fix): content parametresi eklendi.
+  // local_warm/local_hot hedefli dosyalar artık üretilen içeriği bu kolona
+  // yazıyor — masaüstü (TC-4, sessiz polling) bunu /:id/status üzerinden
+  // okuyup diske yazacak. content verilmezse kolon dokunulmaz (undefined),
+  // yani 'supabase' hedefli dosyalar (zaten saveToSupabase() ile ayrı
+  // tabloya yazılıyor) bu davranışı etkilemez.
+  const updatePayload: Record<string, unknown> = {
+    status,
+    completed_at:  status === 'completed' ? new Date().toISOString() : null,
+    error_message: errorMsg ?? null,
+  }
+  if (content !== undefined) {
+    updatePayload.content = content
+  }
+
   await supabase
     .from('project_generation_status')
-    .update({
-      status,
-      completed_at:  status === 'completed' ? new Date().toISOString() : null,
-      error_message: errorMsg ?? null,
-    })
+    .update(updatePayload)
     .eq('project_id', projectId)
     .eq('file_name',  fileName)
 }
@@ -869,9 +881,14 @@ export async function runGeneration(opts: GenerationOptions): Promise<Generation
 
         if (file.storageTarget === 'supabase') {
           await saveToSupabase(projectId, file.fileName, result.content)
+          await markFileStatus(projectId, file.fileName, 'completed')
+        } else {
+          // TC-2 (KIRIK 2 fix): local_warm / local_hot hedefli dosyalar artık
+          // content'i project_generation_status.content kolonuna yazıyor —
+          // önceden burada hiçbir kalıcı yazma yoktu, içerik kayboluyordu.
+          await markFileStatus(projectId, file.fileName, 'completed', undefined, result.content)
         }
 
-        await markFileStatus(projectId, file.fileName, 'completed')
         successFiles.push(file.fileName)
 
         const summary = await extractFileSummary(claude, file.fileName, result.content)
