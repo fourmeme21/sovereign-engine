@@ -18,3 +18,19 @@ JWT_SECRET
 
 # Windows
 Thumbs.db
+
+# --- Node / TypeScript build çıktıları ---
+# Doğrulandı (2026-06-24): Railway production CMD'si
+#   npx tsx src/server/index.ts
+# kullanıyor — dist/ klasörü ve engine/src altındaki .js dosyaları
+# runtime'da HİÇ kullanılmıyor (tsx, .js import uzantılarını .ts
+# kaynağına çözümlüyor). Bu dosyalar tamamen zararsız ölü ağırlıktı.
+node_modules/
+/dist/
+engine/src/**/*.js
+engine/src/**/*.js.map
+engine/src/**/*.d.ts
+engine/src/**/*.d.ts.map
+# İstisna: elle yazılmış gerçek kaynaklar (derleme çıktısı DEĞİL)
+!engine/src/routes/github.js
+!engine/src/types/express.d.ts
